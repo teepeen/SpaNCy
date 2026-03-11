@@ -19,7 +19,7 @@ import numpy as np
 import scipy.sparse as sp
 from scipy.spatial import cKDTree
 from sklearn.cluster import MiniBatchKMeans
-from sklearn.preprocessing import StandardScaler
+from sklearn.preprocessing import RobustScaler, StandardScaler
 
 import torch
 import torch.nn as nn
@@ -132,10 +132,14 @@ def assign_marker_cycles(
 
 def log1p_scale(
     X: np.ndarray,
-) -> Tuple[np.ndarray, StandardScaler]:
-    """Apply log1p then per-marker StandardScaler. Returns transformed data and fitted scaler."""
+) -> Tuple[np.ndarray, RobustScaler]:
+    """Apply log1p then per-marker RobustScaler (median/IQR).
+
+    RobustScaler is much less sensitive to the zero-inflated distributions
+    typical of CyCIF imaging data than StandardScaler.
+    """
     X_log = np.log1p(np.clip(X, 0, None))
-    scaler = StandardScaler()
+    scaler = RobustScaler()
     X_scaled = scaler.fit_transform(X_log)
     return X_scaled.astype(np.float32), scaler
 
@@ -286,7 +290,7 @@ class Decoder(nn.Module):
             nn.Linear(latent, hidden),
             nn.GELU(),
             nn.Linear(hidden, n_markers),
-            nn.ReLU(),  # non-negative output
+            nn.Softplus(),  # smooth non-negative (no hard clipping to 0)
         )
 
     def forward(self, z: torch.Tensor) -> torch.Tensor:
@@ -598,7 +602,7 @@ def train(
     w_contrast: float = 0.5,
     w_adv: float = 0.3,
     tau: float = 0.1,
-) -> Tuple["SpaNCy", StandardScaler, np.ndarray, Dict[str, List[float]]]:
+) -> Tuple["SpaNCy", RobustScaler, np.ndarray, Dict[str, List[float]]]:
     """Full training loop. Returns (model, scaler, marker_cycles, history).
 
     history keys: 'loss', 'recon', 'contrast', 'adv', 'lr', 'grl_lambda'
@@ -772,7 +776,7 @@ def train(
 def normalize_adata(
     adata: ad.AnnData,
     model: SpaNCy,
-    scaler: StandardScaler,
+    scaler: RobustScaler,
     marker_cycles: np.ndarray,
     k_neighbors: int = 15,
     device_str: str = "cpu",
@@ -829,9 +833,11 @@ def normalize_adata(
             log.info("Inference chunk %d/%d", chunk_i + 1, n_chunks)
 
     # Inverse transform: unscale -> expm1
+    # The decoder outputs in scaled log1p space; invert back to original scale
     X_norm_log = scaler.inverse_transform(X_norm_scaled)
-    X_norm = np.expm1(np.clip(X_norm_log, 0, None))
-    X_norm = np.clip(X_norm, 0, None)  # ensure non-negative
+    # expm1 inverts log1p; clip large negatives to avoid numerical issues
+    X_norm = np.expm1(X_norm_log)
+    X_norm = np.clip(X_norm, 0, None)  # floor at 0 (physical constraint)
 
     adata.layers["normalized"] = X_norm
     log.info(
