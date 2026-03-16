@@ -31,12 +31,13 @@ from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 from torch_geometric.data import Data, Batch
 from torch_geometric.nn import GATv2Conv
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    datefmt="%H:%M:%S",
-)
 log = logging.getLogger("spancy")
+log.setLevel(logging.INFO)
+if not log.handlers:
+    _handler = logging.StreamHandler(sys.stdout)
+    _handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", datefmt="%H:%M:%S"))
+    log.addHandler(_handler)
+    log.propagate = False  # avoid duplicate messages if root logger is also configured
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Default cycle assignment for PRAD-CyCIF 20-marker panel
@@ -281,8 +282,16 @@ class SpatialGNNEncoder(nn.Module):
         return self.out_proj(h)
 
 
-class Decoder(nn.Module):
-    """Reconstruct normalized marker expression from latent."""
+class ResidualDecoder(nn.Module):
+    """Predicts a small per-cell correction (delta) from the latent.
+
+    Output = X_corrected + delta.  The Huber reconstruction loss keeps delta
+    small (preserving original distribution shape), while the alignment and
+    adversarial losses provide gradient for batch-specific adjustments.
+
+    Initialized with near-zero final layer so delta ≈ 0 at the start of
+    training (identity-like initialization).
+    """
 
     def __init__(self, latent: int = 64, hidden: int = 128, n_markers: int = 20):
         super().__init__()
@@ -290,10 +299,13 @@ class Decoder(nn.Module):
             nn.Linear(latent, hidden),
             nn.GELU(),
             nn.Linear(hidden, n_markers),
-            nn.Softplus(),  # smooth non-negative (no hard clipping to 0)
         )
+        # Initialize final linear layer near zero so initial delta ≈ 0
+        nn.init.zeros_(self.net[-1].bias)
+        nn.init.normal_(self.net[-1].weight, std=0.01)
 
     def forward(self, z: torch.Tensor) -> torch.Tensor:
+        """Returns the residual correction (delta), NOT the full output."""
         return self.net(z)
 
 
@@ -345,7 +357,7 @@ class SpaNCy(nn.Module):
         super().__init__()
         self.cycle_model = CycleDegradationModel(n_batches, n_cycles, n_markers)
         self.encoder = SpatialGNNEncoder(n_markers, hidden, latent, heads)
-        self.decoder = Decoder(latent, hidden, n_markers)
+        self.decoder = ResidualDecoder(latent, hidden, n_markers)
         self.proj_head = ProjectionHead(latent, proj_dim)
         self.batch_disc = BatchDiscriminator(latent, n_batches)
 
@@ -359,13 +371,15 @@ class SpaNCy(nn.Module):
     ) -> Dict[str, torch.Tensor]:
         X_corrected = self.cycle_model.correct(X, batch_ids, marker_cycles)
         z = self.encoder(X_corrected, edge_index)
-        X_recon = self.decoder(z)
+        delta = self.decoder(z)
+        X_recon = X_corrected + delta  # residual correction
         z_proj = self.proj_head(z)
         batch_logits = self.batch_disc(z, grl_lambda)
 
         return {
             "X_corrected": X_corrected,
             "z": z,
+            "delta": delta,
             "X_recon": X_recon,
             "z_proj": z_proj,
             "batch_logits": batch_logits,
@@ -382,7 +396,8 @@ class SpaNCy(nn.Module):
         self.eval()
         X_corrected = self.cycle_model.correct(X, batch_ids, marker_cycles)
         z = self.encoder(X_corrected, edge_index)
-        return self.decoder(z)
+        delta = self.decoder(z)
+        return X_corrected + delta
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -438,6 +453,49 @@ def nt_xent_loss(
     log_denom = torch.logsumexp(sim[src_local], dim=-1)  # (E,)
     loss = (-pos_sim + log_denom).mean()
     return loss
+
+
+def location_scale_loss(
+    X_recon: torch.Tensor,
+    batch_ids: torch.Tensor,
+) -> torch.Tensor:
+    """Gentle per-marker location-scale alignment across batches.
+
+    Penalizes differences in per-marker MEAN and VARIANCE between each batch
+    and the global statistics.  This corrects batch shifts and scale differences
+    without forcing identical distributions — preserving bimodality, skew,
+    and other biological structure within each batch.
+    """
+    unique_batches = torch.unique(batch_ids)
+    if unique_batches.size(0) < 2:
+        return torch.tensor(0.0, device=X_recon.device)
+
+    # Global per-marker stats (across all batches in this mini-batch)
+    global_mean = X_recon.mean(dim=0)           # (M,)
+    global_var = X_recon.var(dim=0).clamp(min=1e-6)  # (M,)
+
+    mean_loss = torch.tensor(0.0, device=X_recon.device)
+    var_loss = torch.tensor(0.0, device=X_recon.device)
+    n_batches = 0
+
+    for b in unique_batches:
+        mask = batch_ids == b
+        if mask.sum() < 10:
+            continue
+        batch_x = X_recon[mask]
+        b_mean = batch_x.mean(dim=0)            # (M,)
+        b_var = batch_x.var(dim=0).clamp(min=1e-6)  # (M,)
+
+        # L2 penalty on mean difference (normalized by global std for scale-invariance)
+        mean_loss = mean_loss + ((b_mean - global_mean) ** 2 / global_var).mean()
+        # Log-ratio penalty on variance (symmetric, scale-invariant)
+        var_loss = var_loss + (torch.log(b_var / global_var) ** 2).mean()
+        n_batches += 1
+
+    if n_batches == 0:
+        return torch.tensor(0.0, device=X_recon.device)
+
+    return (mean_loss + var_loss) / n_batches
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -601,11 +659,12 @@ def train(
     grl_ramp_epochs: int = 30,
     w_contrast: float = 0.5,
     w_adv: float = 0.3,
+    w_align: float = 0.3,
     tau: float = 0.1,
 ) -> Tuple["SpaNCy", RobustScaler, np.ndarray, Dict[str, List[float]]]:
     """Full training loop. Returns (model, scaler, marker_cycles, history).
 
-    history keys: 'loss', 'recon', 'contrast', 'adv', 'lr', 'grl_lambda'
+    history keys: 'loss', 'recon', 'contrast', 'adv', 'align', 'lr', 'grl_lambda'
     — one entry per epoch (averaged over steps).
     """
     device = torch.device(device_str)
@@ -684,7 +743,7 @@ def train(
     model.train()
 
     history: Dict[str, List[float]] = {
-        "loss": [], "recon": [], "contrast": [], "adv": [],
+        "loss": [], "recon": [], "contrast": [], "adv": [], "align": [],
         "lr": [], "grl_lambda": [],
     }
 
@@ -693,6 +752,7 @@ def train(
         epoch_recon = 0.0
         epoch_contrast = 0.0
         epoch_adv = 0.0
+        epoch_align = 0.0
 
         # GRL lambda ramp
         if epoch < grl_ramp_epochs:
@@ -719,8 +779,12 @@ def train(
             loss_recon = huber(out["X_recon"], out["X_corrected"])
             loss_contrast = nt_xent_loss(out["z_proj"], edge_local, tau=tau)
             loss_adv = ce(out["batch_logits"], batch_ids)
+            loss_align = location_scale_loss(out["X_recon"], batch_ids)
 
-            loss = loss_recon + w_contrast * loss_contrast + w_adv * loss_adv
+            loss = (loss_recon
+                    + w_contrast * loss_contrast
+                    + w_adv * loss_adv
+                    + w_align * loss_align)
 
             optimizer.zero_grad()
             loss.backward()
@@ -731,14 +795,15 @@ def train(
             epoch_recon += loss_recon.item()
             epoch_contrast += loss_contrast.item()
             epoch_adv += loss_adv.item()
+            epoch_align += loss_align.item()
 
             # Per-step progress for long epochs
             if steps_per_epoch > 20 and (step + 1) % max(1, steps_per_epoch // 5) == 0:
                 log.info(
-                    "  Epoch %3d  step %d/%d  loss=%.4f  recon=%.4f  contrast=%.4f  adv=%.4f",
+                    "  Epoch %3d  step %d/%d  loss=%.4f  recon=%.4f  contrast=%.4f  adv=%.4f  align=%.4f",
                     epoch + 1, step + 1, steps_per_epoch,
                     loss.item(), loss_recon.item(),
-                    loss_contrast.item(), loss_adv.item(),
+                    loss_contrast.item(), loss_adv.item(), loss_align.item(),
                 )
 
         scheduler.step()
@@ -749,22 +814,69 @@ def train(
         history["recon"].append(epoch_recon / n_steps)
         history["contrast"].append(epoch_contrast / n_steps)
         history["adv"].append(epoch_adv / n_steps)
+        history["align"].append(epoch_align / n_steps)
         history["lr"].append(optimizer.param_groups[0]["lr"])
         history["grl_lambda"].append(grl_lam)
 
         # Log every epoch (not just every 10th)
         log.info(
-            "Epoch %3d/%d  loss=%.4f  recon=%.4f  contrast=%.4f  adv=%.4f  "
+            "Epoch %3d/%d  loss=%.4f  recon=%.4f  contrast=%.4f  adv=%.4f  align=%.4f  "
             "grl=%.2f  lr=%.2e  [%d cells/step]",
             epoch + 1, n_epochs,
             history["loss"][-1], history["recon"][-1],
             history["contrast"][-1], history["adv"][-1],
+            history["align"][-1],
             grl_lam, optimizer.param_groups[0]["lr"],
             cells_per_step,
         )
 
     log.info("Training complete. Final loss=%.4f", history["loss"][-1])
     return model, scaler, marker_cycles, history
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Post-hoc quantile alignment
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+def sample_median_align(
+    X: np.ndarray,
+    sample_ids: np.ndarray,
+) -> np.ndarray:
+    """Per-marker, per-sample median alignment.
+
+    For each marker, shifts each sample's values so that its median matches
+    the global median.  This is a pure translation (no scaling) — it cannot
+    distort distribution shape, compress tails, or create artifacts.
+
+    Corrects sample-to-sample intensity offsets that the per-batch affine
+    correction cannot capture (e.g., within-batch variation across samples).
+
+    Args:
+        X: (N, M) expression matrix.
+        sample_ids: (N,) per-cell sample labels.
+
+    Returns:
+        X_aligned: (N, M) median-aligned expression matrix.
+    """
+    unique_samples = np.unique(sample_ids)
+    n_markers = X.shape[1]
+
+    X_aligned = X.copy()
+
+    for m in range(n_markers):
+        col = X[:, m]
+        ref_median = np.median(col)
+
+        for s in unique_samples:
+            mask = sample_ids == s
+            vals = col[mask]
+            if len(vals) < 10:
+                continue
+            s_median = np.median(vals)
+            X_aligned[mask, m] = vals - s_median + ref_median
+
+    return X_aligned
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -781,8 +893,33 @@ def normalize_adata(
     k_neighbors: int = 15,
     device_str: str = "cpu",
     inference_batch_size: int = 50000,
+    mode: str = "affine",
+    align_samples: bool = True,
+    sample_col: str = "sample_id",
 ) -> ad.AnnData:
-    """Run inference and store results in adata.layers['normalized']."""
+    """Run inference and store results in adata.layers['normalized'].
+
+    Args:
+        mode: Correction strategy.
+            "affine"   — (default) Apply only the learned CycleDegradationModel
+                         correction (per-batch, per-marker gamma/beta).  This is
+                         a pure shift+scale that **perfectly preserves distribution
+                         shape** (bimodality, positive populations, tails).
+                         The GNN/decoder are used only during training as a
+                         scaffold to learn good gamma/beta values.
+            "residual" — Full pipeline: affine correction + GNN encoder → residual
+                         decoder.  Better batch alignment (kBET) but may distort
+                         distribution shape.
+        align_samples: If True (default), apply post-hoc per-marker,
+            per-sample median alignment after the primary correction.
+            For each marker, each sample's distribution is shifted so its
+            median matches the global median.  This is a pure translation
+            (no scaling) — it cannot distort distribution shape in any way.
+            Corrects sample-to-sample intensity offsets that the per-batch
+            correction cannot capture.
+        sample_col: obs column identifying individual samples for alignment.
+            Default "sample_id".
+    """
     device = torch.device(device_str)
     model = model.to(device)
     model.eval()
@@ -797,12 +934,6 @@ def normalize_adata(
     batch_cats = adata.obs["batch"].astype("category")
     batch_codes = batch_cats.cat.codes.values.astype(np.int64)
 
-    coords = get_spatial_coords(adata)
-    scene_ids = get_scene_ids(adata)
-
-    log.info("Building inference spatial graph...")
-    edge_index_np = build_knn_graph(coords, scene_ids, k=k_neighbors)
-
     marker_cycles_t = torch.tensor(marker_cycles, dtype=torch.long, device=device)
     X_all = torch.tensor(X_scaled, dtype=torch.float32)
     batch_all = torch.tensor(batch_codes, dtype=torch.long)
@@ -811,41 +942,98 @@ def normalize_adata(
     n_markers = adata.n_vars
     X_norm_scaled = np.zeros((n_cells, n_markers), dtype=np.float32)
 
-    # Process in chunks to manage memory
-    all_indices = np.arange(n_cells)
-    n_chunks = max(1, math.ceil(n_cells / inference_batch_size))
+    if mode == "affine":
+        # ── Affine-only: just apply learned gamma/beta ──────────────────
+        # No spatial graph needed — much faster, perfectly shape-preserving.
+        log.info("Normalizing with affine-only correction (shape-preserving)...")
 
-    for chunk_i in range(n_chunks):
-        start = chunk_i * inference_batch_size
-        end = min(start + inference_batch_size, n_cells)
-        idx = all_indices[start:end]
+        for chunk_i in range(max(1, math.ceil(n_cells / inference_batch_size))):
+            start = chunk_i * inference_batch_size
+            end = min(start + inference_batch_size, n_cells)
 
-        edge_local, _ = build_subgraph(edge_index_np, idx)
-        edge_local = edge_local.to(device)
+            X_chunk = X_all[start:end].to(device)
+            batch_chunk = batch_all[start:end].to(device)
 
-        X_chunk = X_all[idx].to(device)
-        batch_chunk = batch_all[idx].to(device)
+            X_out = model.cycle_model.correct(X_chunk, batch_chunk, marker_cycles_t)
+            X_norm_scaled[start:end] = X_out.cpu().numpy()
 
-        X_out = model.normalize(X_chunk, edge_local, batch_chunk, marker_cycles_t)
-        X_norm_scaled[start:end] = X_out.cpu().numpy()
+            if (chunk_i + 1) % 10 == 0 or chunk_i == 0:
+                log.info("Inference chunk %d/%d", chunk_i + 1,
+                         max(1, math.ceil(n_cells / inference_batch_size)))
 
-        if (chunk_i + 1) % 10 == 0 or chunk_i == 0:
-            log.info("Inference chunk %d/%d", chunk_i + 1, n_chunks)
+    elif mode == "residual":
+        # ── Full pipeline: affine + GNN + residual decoder ──────────────
+        coords = get_spatial_coords(adata)
+        scene_ids = get_scene_ids(adata)
 
-    # Inverse transform: unscale -> expm1
-    # The decoder outputs in scaled log1p space; invert back to original scale
+        log.info("Normalizing with full residual pipeline...")
+        log.info("Building inference spatial graph...")
+        edge_index_np = build_knn_graph(coords, scene_ids, k=k_neighbors)
+
+        all_indices = np.arange(n_cells)
+        n_chunks = max(1, math.ceil(n_cells / inference_batch_size))
+
+        for chunk_i in range(n_chunks):
+            start = chunk_i * inference_batch_size
+            end = min(start + inference_batch_size, n_cells)
+            idx = all_indices[start:end]
+
+            edge_local, _ = build_subgraph(edge_index_np, idx)
+            edge_local = edge_local.to(device)
+
+            X_chunk = X_all[idx].to(device)
+            batch_chunk = batch_all[idx].to(device)
+
+            X_out = model.normalize(X_chunk, edge_local, batch_chunk, marker_cycles_t)
+            X_norm_scaled[start:end] = X_out.cpu().numpy()
+
+            if (chunk_i + 1) % 10 == 0 or chunk_i == 0:
+                log.info("Inference chunk %d/%d", chunk_i + 1, n_chunks)
+    else:
+        raise ValueError(f"Unknown mode '{mode}'. Use 'affine' or 'residual'.")
+
+    # Inverse transform: unscale → log space
     X_norm_log = scaler.inverse_transform(X_norm_scaled)
-    # expm1 inverts log1p; clip large negatives to avoid numerical issues
+
+    # Per-sample median alignment IN LOG SPACE (before expm1).
+    # Shifting in log space = multiplicative scaling in original space,
+    # which cannot push values to zero or create clipping artifacts.
+    if align_samples:
+        s_col = None
+        for col in (sample_col, "sample", "Sample", "patient_id", "patient"):
+            if col in adata.obs.columns:
+                s_col = col
+                break
+        if s_col is not None:
+            sample_ids = adata.obs[s_col].values
+            n_unique = len(np.unique(sample_ids))
+            if n_unique > 1:
+                log.info(
+                    "Applying per-sample median alignment in log space "
+                    "across %d samples (col='%s')...",
+                    n_unique, s_col,
+                )
+                X_norm_log = sample_median_align(X_norm_log, sample_ids)
+            else:
+                log.info("Only 1 sample found — skipping sample alignment.")
+        else:
+            log.warning(
+                "align_samples=True but no sample column found "
+                "(tried: %s, sample, Sample, patient_id). Skipping.",
+                sample_col,
+            )
+
+    # expm1 inverts log1p; clip at 0 (physical constraint)
     X_norm = np.expm1(X_norm_log)
-    X_norm = np.clip(X_norm, 0, None)  # floor at 0 (physical constraint)
+    X_norm = np.clip(X_norm, 0, None)
 
     adata.layers["normalized"] = X_norm
     log.info(
-        "Normalization complete. Stored in adata.layers['normalized'] "
+        "Normalization complete [mode=%s, quantile_align=%s]. "
+        "Stored in adata.layers['normalized'] "
         "(min=%.4f, max=%.4f, mean=%.4f)",
-        X_norm.min(),
-        X_norm.max(),
-        X_norm.mean(),
+        mode, align_samples,
+        X_norm.min(), X_norm.max(), X_norm.mean(),
     )
     return adata
 
@@ -879,6 +1067,7 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p.add_argument("--grl_ramp_epochs", type=int, default=30, help="GRL ramp epochs (default: 30)")
     p.add_argument("--w_contrast", type=float, default=0.5, help="Contrastive loss weight (default: 0.5)")
     p.add_argument("--w_adv", type=float, default=0.3, help="Adversarial loss weight (default: 0.3)")
+    p.add_argument("--w_align", type=float, default=0.3, help="Location-scale alignment weight (default: 0.3)")
     p.add_argument("--tau", type=float, default=0.1, help="NT-Xent temperature (default: 0.1)")
     return p.parse_args(argv)
 
@@ -917,6 +1106,7 @@ def main(argv: Optional[List[str]] = None) -> None:
         grl_ramp_epochs=args.grl_ramp_epochs,
         w_contrast=args.w_contrast,
         w_adv=args.w_adv,
+        w_align=args.w_align,
         tau=args.tau,
     )
 

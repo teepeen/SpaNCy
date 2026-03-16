@@ -7,20 +7,27 @@ GitHub repo: https://github.com/teepeen/SpaNCy
 
 ## Architecture
 ```
-X_raw + batch_id + (x,y) → CycleDegradationModel → SpatialGNNEncoder (GATv2) → Decoder + ProjectionHead + BatchDiscriminator
+X_raw + batch_id + (x,y) → CycleDegradationModel → SpatialGNNEncoder (GATv2) → ResidualDecoder + ProjectionHead + BatchDiscriminator
 ```
 - **CycleDegradationModel**: batch(32d) + cycle(16d) embeddings → MLP → per-marker gamma/beta
 - **SpatialGNNEncoder**: Linear→128 + 2x GATv2Conv(128, 4 heads) + residual + LayerNorm → 64d latent
-- **Decoder**: 64→128→20, GELU + **Softplus** (not ReLU — avoids zero-spike artifact)
+- **ResidualDecoder**: 64→128→20, GELU, no output activation. Outputs a **delta** (correction), not the full expression. Final output = `X_corrected + delta`. Initialized near-zero so training starts from identity.
 - **ProjectionHead**: 64→64→32, L2-normalized (training only)
 - **BatchDiscriminator**: 64→32→n_batches with gradient reversal
-- **Losses**: Huber (recon) + NT-Xent (contrastive, spatial-neighbor positives) + CE (adversarial)
-- **Total**: `L_recon + 0.5*L_contrast + 0.3*L_adv`
+- **Losses**: Huber (recon, penalizes delta magnitude) + NT-Xent (contrastive) + CE (adversarial) + location-scale alignment
+- **Total**: `L_recon + 0.5*L_contrast + 0.3*L_adv + 0.3*L_align`
+
+## Inference Pipeline (Two-Stage)
+At inference, the GNN/decoder are **not used** — they serve only as a training scaffold.
+1. **Affine correction** (default `mode="affine"`): Only the CycleDegradationModel's learned gamma/beta are applied: `X_corrected = (X - beta) / gamma`. This is a pure shift+scale per batch per marker — perfectly preserves distribution shape.
+2. **Per-sample median alignment** (`align_samples=True`): For each marker, shifts each sample's distribution in **log space** so its median matches the global median. Pure translation in log space = multiplicative scaling in original space — cannot push values to zero or create clipping artifacts.
+
+Alternative: `mode="residual"` uses the full GNN pipeline (better kBET but distorts distribution shape).
 
 ## Files
 | File | Purpose |
 |------|---------|
-| `spancy.py` | Full implementation (~850 lines): models, training, inference, CLI |
+| `spancy.py` | Full implementation (~1050 lines): models, training, inference, CLI |
 | `requirements.txt` | Dependencies: torch, torch-geometric, anndata, numpy, scipy, scikit-learn |
 | `spancy_explore.ipynb` | Dev/exploration notebook — step through pipeline interactively |
 | `spancy_demo.ipynb` | Demo/tutorial — run SpaNCy, UMAP before/after, KS statistics |
@@ -33,12 +40,16 @@ X_raw + batch_id + (x,y) → CycleDegradationModel → SpatialGNNEncoder (GATv2)
 
 ## Key Design Decisions & Fixes Applied
 1. **RobustScaler instead of StandardScaler** — CyCIF data is zero-inflated; mean/std scaling biases everything toward zero. RobustScaler (median/IQR) handles this correctly.
-2. **Softplus instead of ReLU in decoder** — ReLU clips negative scaled values to exactly 0, creating a massive zero-spike after expm1. Softplus is smooth and strictly positive.
-3. **AdjacencyIndex (CSR) for fast subgraph extraction** — Pre-built at training start. O(batch*k) per step instead of O(E) scanning all ~26M edges.
-4. **Vectorized kNN graph building** — numpy broadcast instead of nested Python loops.
-5. **cells_per_step default = 16000** — reduces steps/epoch from ~293 to ~110 for 1.76M cells.
-6. **CosineAnnealingLR T_max floors at 1** — prevents ZeroDivisionError when n_epochs <= warmup_epochs.
-7. **train() returns history dict** — tracks loss/recon/contrast/adv/lr/grl_lambda per epoch for plotting.
+2. **No output activation in decoder** — ReLU caused zero-spike, Softplus caused left-edge compression (can't represent negative scaled values). Decoder now outputs unconstrained values in scaled space; non-negativity enforced after full inverse transform.
+3. **ResidualDecoder instead of full Decoder** — Full encode→decode through GNN bottleneck distorts distribution shapes (smooths bimodality). Residual approach: `output = X_corrected + small_delta` preserves original signal, model only learns corrections.
+4. **Affine-only inference** — GNN/decoder used only during training as scaffold. At inference, only CycleDegradationModel correction applied (shape-preserving).
+5. **Per-sample median alignment in log space** — Handles within-batch sample variation. Done in log space (before expm1) so shifts are multiplicative in original space — cannot create zero-clipping artifacts.
+6. **location_scale_loss** — Per-marker mean/variance alignment across batches during training. Gentler than MMD which collapsed all variation.
+7. **AdjacencyIndex (CSR) for fast subgraph extraction** — Pre-built at training start. O(batch*k) per step instead of O(E) scanning all ~26M edges.
+8. **Vectorized kNN graph building** — numpy broadcast instead of nested Python loops.
+9. **CosineAnnealingLR T_max floors at 1** — prevents ZeroDivisionError when n_epochs <= warmup_epochs.
+10. **Explicit logger setup** — `StreamHandler(sys.stdout)` on the `spancy` logger, not `logging.basicConfig()`. Ensures output in Colab/Jupyter where root logger is pre-configured.
+11. **train() returns history dict** — tracks loss/recon/contrast/adv/align/lr/grl_lambda per epoch.
 
 ## Colab Usage
 Both notebooks have Section 0 (Colab Setup) that:
@@ -52,7 +63,8 @@ python spancy.py --input PRAD_anndata.h5ad --output PRAD_normalized.h5ad --epoch
 ```
 
 ## Known Issues / Next Steps
-- **Zero-spike in normalized output** was caused by ReLU + StandardScaler combo. Fixed with Softplus + RobustScaler — needs re-verification after retraining.
+- Distribution alignment is work-in-progress: affine correction + median shift preserves shapes but some markers still show sample-to-sample variation that per-batch correction can't fully capture.
 - Training on 1.76M cells takes significant time even with optimizations. Consider reducing epochs for initial testing (`--epochs 10`).
-- Contrastive loss uses spatial-neighbor positives only; cross-batch phenotype-matched positives (mentioned in plan) not yet implemented.
+- Contrastive loss uses spatial-neighbor positives only; cross-batch phenotype-matched positives not yet implemented.
 - GRL lambda ramps 0→1 over 30 epochs by default.
+- Need to validate with kBET and positive population preservation metrics side-by-side.
