@@ -17,6 +17,8 @@ from typing import Dict, List, Optional, Tuple
 import anndata as ad
 import numpy as np
 import scipy.sparse as sp
+from scipy.ndimage import gaussian_filter1d
+from scipy.signal import find_peaks
 from scipy.spatial import cKDTree
 from sklearn.cluster import MiniBatchKMeans
 from sklearn.preprocessing import RobustScaler, StandardScaler
@@ -214,52 +216,71 @@ def grad_reverse(x: torch.Tensor, lam: float = 1.0) -> torch.Tensor:
 
 
 class CycleDegradationModel(nn.Module):
-    """Learns per-batch, per-cycle scale (gamma) and shift (beta) for markers."""
+    """Learns per-batch, per-sample, per-cycle scale (gamma) and shift (beta).
 
-    def __init__(self, n_batches: int, n_cycles: int, n_markers: int):
+    Each marker's correction is conditioned on:
+    - batch identity (32d embedding) — captures batch-level systematic effects
+    - sample identity (16d embedding) — captures within-batch sample variation
+    - marker's imaging cycle (16d embedding) — captures cycle-specific degradation
+
+    The MLP is shared across markers but receives per-marker cycle embeddings,
+    so markers in different imaging cycles get different corrections.
+    """
+
+    def __init__(self, n_batches: int, n_samples: int, n_cycles: int, n_markers: int):
         super().__init__()
         self.batch_embed = nn.Embedding(n_batches, 32)
+        self.sample_embed = nn.Embedding(n_samples, 16)
         self.cycle_embed = nn.Embedding(n_cycles, 16)
         self.n_markers = n_markers
 
+        # Shared MLP applied per marker: (batch_32 + sample_16 + cycle_16) = 64 → 2
         self.mlp = nn.Sequential(
-            nn.Linear(48, 64),
+            nn.Linear(64, 64),
             nn.GELU(),
-            nn.Linear(64, n_markers * 2),
+            nn.Linear(64, 2),
         )
 
     def forward(
         self,
         batch_ids: torch.Tensor,
+        sample_ids: torch.Tensor,
         marker_cycles: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Args:
             batch_ids: (B,) batch index per cell
-            marker_cycles: (M,) cycle index per marker (shared across cells)
+            sample_ids: (B,) sample index per cell
+            marker_cycles: (M,) cycle index per marker
         Returns:
             gamma: (B, M) scale (strictly positive via softplus)
             beta:  (B, M) shift
         """
-        b_emb = self.batch_embed(batch_ids)  # (B, 32)
-
-        # Aggregate cycle embeddings for each marker -> average cycle context
+        b_emb = self.batch_embed(batch_ids)      # (B, 32)
+        s_emb = self.sample_embed(sample_ids)    # (B, 16)
         c_emb = self.cycle_embed(marker_cycles)  # (M, 16)
-        c_mean = c_emb.mean(dim=0, keepdim=True).expand(b_emb.size(0), -1)  # (B, 16)
 
-        h = torch.cat([b_emb, c_mean], dim=-1)  # (B, 48)
-        out = self.mlp(h)  # (B, 2*M)
-        gamma_raw, beta = out.split(self.n_markers, dim=-1)
-        gamma = F.softplus(gamma_raw) + 0.1  # avoid collapse
+        # Build per-cell, per-marker input: (B, M, 64)
+        B = b_emb.size(0)
+        M = self.n_markers
+        bs = torch.cat([b_emb, s_emb], dim=-1)    # (B, 48)
+        bs = bs.unsqueeze(1).expand(B, M, 48)     # (B, M, 48)
+        c = c_emb.unsqueeze(0).expand(B, M, 16)   # (B, M, 16)
+        h = torch.cat([bs, c], dim=-1)             # (B, M, 64)
+
+        out = self.mlp(h)                          # (B, M, 2)
+        gamma = F.softplus(out[..., 0]) + 0.1     # (B, M)
+        beta = out[..., 1]                         # (B, M)
         return gamma, beta
 
     def correct(
         self,
         X: torch.Tensor,
         batch_ids: torch.Tensor,
+        sample_ids: torch.Tensor,
         marker_cycles: torch.Tensor,
     ) -> torch.Tensor:
-        gamma, beta = self(batch_ids, marker_cycles)
+        gamma, beta = self(batch_ids, sample_ids, marker_cycles)
         return (X - beta) / gamma
 
 
@@ -348,6 +369,7 @@ class SpaNCy(nn.Module):
         self,
         n_markers: int,
         n_batches: int,
+        n_samples: int,
         n_cycles: int,
         hidden: int = 128,
         latent: int = 64,
@@ -355,7 +377,7 @@ class SpaNCy(nn.Module):
         proj_dim: int = 32,
     ):
         super().__init__()
-        self.cycle_model = CycleDegradationModel(n_batches, n_cycles, n_markers)
+        self.cycle_model = CycleDegradationModel(n_batches, n_samples, n_cycles, n_markers)
         self.encoder = SpatialGNNEncoder(n_markers, hidden, latent, heads)
         self.decoder = ResidualDecoder(latent, hidden, n_markers)
         self.proj_head = ProjectionHead(latent, proj_dim)
@@ -366,10 +388,11 @@ class SpaNCy(nn.Module):
         X: torch.Tensor,
         edge_index: torch.Tensor,
         batch_ids: torch.Tensor,
+        sample_ids: torch.Tensor,
         marker_cycles: torch.Tensor,
         grl_lambda: float = 1.0,
     ) -> Dict[str, torch.Tensor]:
-        X_corrected = self.cycle_model.correct(X, batch_ids, marker_cycles)
+        X_corrected = self.cycle_model.correct(X, batch_ids, sample_ids, marker_cycles)
         z = self.encoder(X_corrected, edge_index)
         delta = self.decoder(z)
         X_recon = X_corrected + delta  # residual correction
@@ -391,10 +414,11 @@ class SpaNCy(nn.Module):
         X: torch.Tensor,
         edge_index: torch.Tensor,
         batch_ids: torch.Tensor,
+        sample_ids: torch.Tensor,
         marker_cycles: torch.Tensor,
     ) -> torch.Tensor:
         self.eval()
-        X_corrected = self.cycle_model.correct(X, batch_ids, marker_cycles)
+        X_corrected = self.cycle_model.correct(X, batch_ids, sample_ids, marker_cycles)
         z = self.encoder(X_corrected, edge_index)
         delta = self.decoder(z)
         return X_corrected + delta
@@ -455,47 +479,52 @@ def nt_xent_loss(
     return loss
 
 
-def location_scale_loss(
+def quantile_alignment_loss(
     X_recon: torch.Tensor,
-    batch_ids: torch.Tensor,
+    sample_ids: torch.Tensor,
+    quantiles: Tuple[float, ...] = (0.1, 0.25),
 ) -> torch.Tensor:
-    """Gentle per-marker location-scale alignment across batches.
+    """Lower-quantile alignment across samples.
 
-    Penalizes differences in per-marker MEAN and VARIANCE between each batch
-    and the global statistics.  This corrects batch shifts and scale differences
-    without forcing identical distributions — preserving bimodality, skew,
-    and other biological structure within each batch.
+    Only matches the 10th and 25th percentiles of each marker across samples.
+    These quantiles fall safely within the **negative (background) population**
+    for CyCIF markers, regardless of the positive cell fraction.
+
+    Higher quantiles (50th, 75th, 90th) are deliberately excluded because for
+    bimodal markers (e.g. ECAD, CD45) they depend on the biological mixture
+    proportion (% positive cells), which varies across samples.  Forcing those
+    to match distorts biology — some samples get over-corrected.
+
+    Two lower quantiles are sufficient to constrain both location (where the
+    negative peak sits) and scale (how wide it is) of the background population.
     """
-    unique_batches = torch.unique(batch_ids)
-    if unique_batches.size(0) < 2:
+    unique_samples = torch.unique(sample_ids)
+    if unique_samples.size(0) < 2:
         return torch.tensor(0.0, device=X_recon.device)
 
-    # Global per-marker stats (across all batches in this mini-batch)
-    global_mean = X_recon.mean(dim=0)           # (M,)
-    global_var = X_recon.var(dim=0).clamp(min=1e-6)  # (M,)
+    q_tensor = torch.tensor(quantiles, dtype=torch.float32, device=X_recon.device)
 
-    mean_loss = torch.tensor(0.0, device=X_recon.device)
-    var_loss = torch.tensor(0.0, device=X_recon.device)
-    n_batches = 0
+    # Global quantiles across all cells: (Q, M)
+    global_q = torch.quantile(X_recon, q_tensor, dim=0)
+    # Scale factor: spread between the two quantiles, per marker
+    q_spread = (global_q[-1] - global_q[0]).clamp(min=1e-6)  # (M,)
 
-    for b in unique_batches:
-        mask = batch_ids == b
-        if mask.sum() < 10:
+    loss = torch.tensor(0.0, device=X_recon.device)
+    n_counted = 0
+
+    for s in unique_samples:
+        mask = sample_ids == s
+        if mask.sum() < 50:
             continue
-        batch_x = X_recon[mask]
-        b_mean = batch_x.mean(dim=0)            # (M,)
-        b_var = batch_x.var(dim=0).clamp(min=1e-6)  # (M,)
+        sample_q = torch.quantile(X_recon[mask], q_tensor, dim=0)  # (Q, M)
+        # Normalized squared error on lower quantiles only
+        loss = loss + (((sample_q - global_q) / q_spread) ** 2).mean()
+        n_counted += 1
 
-        # L2 penalty on mean difference (normalized by global std for scale-invariance)
-        mean_loss = mean_loss + ((b_mean - global_mean) ** 2 / global_var).mean()
-        # Log-ratio penalty on variance (symmetric, scale-invariant)
-        var_loss = var_loss + (torch.log(b_var / global_var) ** 2).mean()
-        n_batches += 1
-
-    if n_batches == 0:
+    if n_counted == 0:
         return torch.tensor(0.0, device=X_recon.device)
 
-    return (mean_loss + var_loss) / n_batches
+    return loss / n_counted
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -653,13 +682,13 @@ def train(
     weight_decay: float = 1e-4,
     k_neighbors: int = 15,
     cluster_size: int = 500,
-    cells_per_step: int = 6000,
+    cells_per_step: int = 12000,
     device_str: str = "cpu",
     warmup_epochs: int = 5,
     grl_ramp_epochs: int = 30,
     w_contrast: float = 0.5,
     w_adv: float = 0.3,
-    w_align: float = 0.3,
+    w_align: float = 0.5,
     tau: float = 0.1,
 ) -> Tuple["SpaNCy", RobustScaler, np.ndarray, Dict[str, List[float]]]:
     """Full training loop. Returns (model, scaler, marker_cycles, history).
@@ -685,7 +714,23 @@ def train(
     batch_cats = adata.obs["batch"].astype("category")
     batch_codes = batch_cats.cat.codes.values.astype(np.int64)
     n_batches = int(batch_codes.max()) + 1
-    log.info("Detected %d batches, %d cycles, %d markers", n_batches, n_cycles, n_markers)
+
+    # Encode sample labels (finer-grained than batch)
+    sample_col = None
+    for col in ("sample_id", "sample", "Sample", "patient_id", "patient"):
+        if col in adata.obs.columns:
+            sample_col = col
+            break
+    if sample_col is None:
+        sample_col = "batch"
+        log.warning("No sample column found; using 'batch' as sample proxy")
+    sample_cats = adata.obs[sample_col].astype("category")
+    sample_codes = sample_cats.cat.codes.values.astype(np.int64)
+    n_samples = int(sample_codes.max()) + 1
+    log.info(
+        "Detected %d batches, %d samples (col='%s'), %d cycles, %d markers",
+        n_batches, n_samples, sample_col, n_cycles, n_markers,
+    )
 
     # Spatial graph
     coords = get_spatial_coords(adata)
@@ -702,6 +747,7 @@ def train(
     model = SpaNCy(
         n_markers=n_markers,
         n_batches=n_batches,
+        n_samples=n_samples,
         n_cycles=n_cycles,
     ).to(device)
 
@@ -727,6 +773,7 @@ def train(
     # -- Tensors --
     X_all = torch.tensor(X_scaled, dtype=torch.float32)
     batch_all = torch.tensor(batch_codes, dtype=torch.long)
+    sample_all = torch.tensor(sample_codes, dtype=torch.long)
 
     # -- Training loop --
     huber = nn.HuberLoss(delta=1.0)
@@ -771,15 +818,16 @@ def train(
 
             X_batch = X_all[idx].to(device)
             batch_ids = batch_all[idx].to(device)
+            sample_ids = sample_all[idx].to(device)
 
             # Forward
-            out = model(X_batch, edge_local, batch_ids, marker_cycles_t, grl_lam)
+            out = model(X_batch, edge_local, batch_ids, sample_ids, marker_cycles_t, grl_lam)
 
             # Losses
             loss_recon = huber(out["X_recon"], out["X_corrected"])
             loss_contrast = nt_xent_loss(out["z_proj"], edge_local, tau=tau)
             loss_adv = ce(out["batch_logits"], batch_ids)
-            loss_align = location_scale_loss(out["X_recon"], batch_ids)
+            loss_align = quantile_alignment_loss(out["X_recon"], sample_ids)
 
             loss = (loss_recon
                     + w_contrast * loss_contrast
@@ -835,29 +883,61 @@ def train(
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Post-hoc quantile alignment
+# Post-hoc mode alignment
 # ──────────────────────────────────────────────────────────────────────────────
 
 
-def sample_median_align(
+def _find_negative_peak(counts: np.ndarray, bins: np.ndarray) -> float:
+    """Find the leftmost prominent peak in a histogram.
+
+    For CyCIF markers, the leftmost peak is always the negative/background
+    population.  This is the correct reference for alignment — even when the
+    positive population peak is taller (e.g. ECAD in epithelial-rich samples).
+
+    Uses Gaussian smoothing + scipy peak detection with prominence filtering.
+    """
+    counts_smooth = gaussian_filter1d(counts.astype(np.float64), sigma=2)
+    max_height = counts_smooth.max()
+    if max_height < 1:
+        # Empty histogram — return midpoint
+        return (bins[0] + bins[-1]) / 2
+
+    # Find peaks with at least 5% of max height as prominence
+    peaks, _ = find_peaks(counts_smooth, prominence=max_height * 0.05)
+    if len(peaks) > 0:
+        # Leftmost prominent peak = negative population
+        idx = peaks[0]
+    else:
+        # Fallback: global maximum
+        idx = int(counts_smooth.argmax())
+
+    return (bins[idx] + bins[idx + 1]) / 2
+
+
+def sample_mode_align(
     X: np.ndarray,
     sample_ids: np.ndarray,
+    n_bins: int = 200,
 ) -> np.ndarray:
-    """Per-marker, per-sample median alignment.
+    """Per-marker, per-sample negative-population peak alignment.
 
-    For each marker, shifts each sample's values so that its median matches
-    the global median.  This is a pure translation (no scaling) — it cannot
-    distort distribution shape, compress tails, or create artifacts.
+    For each marker, finds the **leftmost prominent peak** (negative/background
+    population) in each sample's distribution and shifts it to match the
+    global negative peak.  This is a pure translation — no scaling, no shape
+    distortion.
 
-    Corrects sample-to-sample intensity offsets that the per-batch affine
-    correction cannot capture (e.g., within-batch variation across samples).
+    Unlike simple argmax mode-finding, this correctly handles bimodal markers
+    (e.g. ECAD, CD45) where the positive population peak can be *taller* than
+    the negative peak in samples with many positive cells.  The leftmost peak
+    is always the negative population regardless of positive cell fraction.
 
     Args:
-        X: (N, M) expression matrix.
+        X: (N, M) expression matrix (in log space).
         sample_ids: (N,) per-cell sample labels.
+        n_bins: Number of histogram bins for peak estimation.
 
     Returns:
-        X_aligned: (N, M) median-aligned expression matrix.
+        X_aligned: (N, M) peak-aligned expression matrix.
     """
     unique_samples = np.unique(sample_ids)
     n_markers = X.shape[1]
@@ -866,15 +946,24 @@ def sample_median_align(
 
     for m in range(n_markers):
         col = X[:, m]
-        ref_median = np.median(col)
+        # Use global percentile range for consistent binning across samples
+        lo, hi = np.percentile(col, [1, 99])
+        if hi - lo < 1e-6:
+            continue
+        bins = np.linspace(lo, hi, n_bins + 1)
+
+        # Global negative peak
+        counts_global, _ = np.histogram(col, bins=bins)
+        global_peak = _find_negative_peak(counts_global, bins)
 
         for s in unique_samples:
             mask = sample_ids == s
             vals = col[mask]
-            if len(vals) < 10:
+            if len(vals) < 50:
                 continue
-            s_median = np.median(vals)
-            X_aligned[mask, m] = vals - s_median + ref_median
+            counts_s, _ = np.histogram(vals, bins=bins)
+            sample_peak = _find_negative_peak(counts_s, bins)
+            X_aligned[mask, m] = vals - sample_peak + global_peak
 
     return X_aligned
 
@@ -894,7 +983,7 @@ def normalize_adata(
     device_str: str = "cpu",
     inference_batch_size: int = 50000,
     mode: str = "affine",
-    align_samples: bool = True,
+    align_samples: bool = False,
     sample_col: str = "sample_id",
 ) -> ad.AnnData:
     """Run inference and store results in adata.layers['normalized'].
@@ -910,13 +999,14 @@ def normalize_adata(
             "residual" — Full pipeline: affine correction + GNN encoder → residual
                          decoder.  Better batch alignment (kBET) but may distort
                          distribution shape.
-        align_samples: If True (default), apply post-hoc per-marker,
-            per-sample median alignment after the primary correction.
-            For each marker, each sample's distribution is shifted so its
-            median matches the global median.  This is a pure translation
-            (no scaling) — it cannot distort distribution shape in any way.
-            Corrects sample-to-sample intensity offsets that the per-batch
-            correction cannot capture.
+        align_samples: If True, apply post-hoc per-marker, per-sample
+            mode (histogram peak) alignment after the primary correction.
+            For each marker, each sample's dominant peak is shifted to match
+            the global peak.  Unlike median alignment, this is robust to
+            bimodal markers (e.g. ECAD) where the median depends on the
+            positive cell fraction (biology, not batch effect).
+            Default False — the model's per-sample affine correction usually
+            handles this; enable for additional refinement.
         sample_col: obs column identifying individual samples for alignment.
             Default "sample_id".
     """
@@ -934,9 +1024,21 @@ def normalize_adata(
     batch_cats = adata.obs["batch"].astype("category")
     batch_codes = batch_cats.cat.codes.values.astype(np.int64)
 
+    # Encode sample labels (must match training encoding)
+    s_col = None
+    for col in (sample_col, "sample_id", "sample", "Sample", "patient_id", "patient"):
+        if col in adata.obs.columns:
+            s_col = col
+            break
+    if s_col is None:
+        s_col = "batch"
+    sample_cats = adata.obs[s_col].astype("category")
+    sample_codes = sample_cats.cat.codes.values.astype(np.int64)
+
     marker_cycles_t = torch.tensor(marker_cycles, dtype=torch.long, device=device)
     X_all = torch.tensor(X_scaled, dtype=torch.float32)
     batch_all = torch.tensor(batch_codes, dtype=torch.long)
+    sample_all = torch.tensor(sample_codes, dtype=torch.long)
 
     n_cells = adata.n_obs
     n_markers = adata.n_vars
@@ -953,8 +1055,9 @@ def normalize_adata(
 
             X_chunk = X_all[start:end].to(device)
             batch_chunk = batch_all[start:end].to(device)
+            sample_chunk = sample_all[start:end].to(device)
 
-            X_out = model.cycle_model.correct(X_chunk, batch_chunk, marker_cycles_t)
+            X_out = model.cycle_model.correct(X_chunk, batch_chunk, sample_chunk, marker_cycles_t)
             X_norm_scaled[start:end] = X_out.cpu().numpy()
 
             if (chunk_i + 1) % 10 == 0 or chunk_i == 0:
@@ -983,8 +1086,9 @@ def normalize_adata(
 
             X_chunk = X_all[idx].to(device)
             batch_chunk = batch_all[idx].to(device)
+            sample_chunk = sample_all[idx].to(device)
 
-            X_out = model.normalize(X_chunk, edge_local, batch_chunk, marker_cycles_t)
+            X_out = model.normalize(X_chunk, edge_local, batch_chunk, sample_chunk, marker_cycles_t)
             X_norm_scaled[start:end] = X_out.cpu().numpy()
 
             if (chunk_i + 1) % 10 == 0 or chunk_i == 0:
@@ -995,7 +1099,9 @@ def normalize_adata(
     # Inverse transform: unscale → log space
     X_norm_log = scaler.inverse_transform(X_norm_scaled)
 
-    # Per-sample median alignment IN LOG SPACE (before expm1).
+    # Per-sample MODE alignment IN LOG SPACE (before expm1).
+    # Uses histogram peak (mode) instead of median — robust to bimodal
+    # markers where the median depends on positive cell fraction (biology).
     # Shifting in log space = multiplicative scaling in original space,
     # which cannot push values to zero or create clipping artifacts.
     if align_samples:
@@ -1009,11 +1115,11 @@ def normalize_adata(
             n_unique = len(np.unique(sample_ids))
             if n_unique > 1:
                 log.info(
-                    "Applying per-sample median alignment in log space "
+                    "Applying per-sample mode alignment in log space "
                     "across %d samples (col='%s')...",
                     n_unique, s_col,
                 )
-                X_norm_log = sample_median_align(X_norm_log, sample_ids)
+                X_norm_log = sample_mode_align(X_norm_log, sample_ids)
             else:
                 log.info("Only 1 sample found — skipping sample alignment.")
         else:
@@ -1067,7 +1173,7 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p.add_argument("--grl_ramp_epochs", type=int, default=30, help="GRL ramp epochs (default: 30)")
     p.add_argument("--w_contrast", type=float, default=0.5, help="Contrastive loss weight (default: 0.5)")
     p.add_argument("--w_adv", type=float, default=0.3, help="Adversarial loss weight (default: 0.3)")
-    p.add_argument("--w_align", type=float, default=0.3, help="Location-scale alignment weight (default: 0.3)")
+    p.add_argument("--w_align", type=float, default=0.5, help="Quantile alignment weight (default: 0.5)")
     p.add_argument("--tau", type=float, default=0.1, help="NT-Xent temperature (default: 0.1)")
     return p.parse_args(argv)
 
