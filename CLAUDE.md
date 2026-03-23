@@ -14,8 +14,8 @@ X_raw + batch_id + (x,y) → CycleDegradationModel → SpatialGNNEncoder (GATv2)
 - **ResidualDecoder**: 64→128→20, GELU, no output activation. Outputs a **delta** (correction), not the full expression. Final output = `X_corrected + delta`. Initialized near-zero so training starts from identity.
 - **ProjectionHead**: 64→64→32, L2-normalized (training only)
 - **BatchDiscriminator**: 64→32→n_batches with gradient reversal
-- **Losses**: Huber (recon, penalizes delta magnitude) + NT-Xent (contrastive) + CE (adversarial) + lower-quantile alignment (10th/25th percentiles only — safe for bimodal markers)
-- **Total**: `L_recon + 0.5*L_contrast + 0.3*L_adv + 0.5*L_align`
+- **Losses**: Huber (recon, penalizes delta magnitude) + NT-Xent (spatial contrastive) + CE (adversarial) + lower-quantile alignment (10th/25th percentiles only — safe for bimodal markers) + cross-batch NT-Xent (phenotype-matched cross-batch positives)
+- **Total**: `L_recon + 0.5*L_contrast + 0.3*L_adv + 0.5*L_align + 0.5*L_cross_batch`
 
 ## Inference Pipeline (Two-Stage)
 At inference, the GNN/decoder are **not used** — they serve only as a training scaffold.
@@ -43,14 +43,15 @@ Alternative: `mode="residual"` uses the full GNN pipeline (better kBET but disto
 2. **No output activation in decoder** — ReLU caused zero-spike, Softplus caused left-edge compression (can't represent negative scaled values). Decoder now outputs unconstrained values in scaled space; non-negativity enforced after full inverse transform.
 3. **ResidualDecoder instead of full Decoder** — Full encode→decode through GNN bottleneck distorts distribution shapes (smooths bimodality). Residual approach: `output = X_corrected + small_delta` preserves original signal, model only learns corrections.
 4. **Affine-only inference** — GNN/decoder used only during training as scaffold. At inference, only CycleDegradationModel correction applied (shape-preserving).
-5. **Per-sample mode alignment in log space** — Uses histogram peak (mode) instead of median. Robust to bimodal markers (ECAD, CD45) where median depends on positive cell fraction (biology). Done in log space (before expm1) so shifts are multiplicative — no zero-clipping.
+5. **Per-sample piecewise peak alignment in log space** — Detects both negative and positive peaks per marker per sample. Unimodal markers get a pure shift; bimodal markers (ECAD, CD45) get a piecewise linear transform aligning BOTH peaks to the global reference. Corrects nonlinear batch effects where dynamic range varies across samples. Done in log space (before expm1) so transforms are multiplicative — no zero-clipping.
 6. **Lower-quantile alignment loss** — Matches only 10th/25th percentiles across samples (not full distribution). These quantiles are safely within the negative population for all CyCIF markers. Higher quantiles (50/75/90th) are excluded because they depend on biological mixture proportions. Replaced location_scale_loss (mean+var) which was also too coarse.
 7. **Sample embeddings in CycleDegradationModel** — Per-sample (not just per-batch) affine correction: 20 correction groups instead of 7. Each marker uses its actual cycle embedding (not averaged). Eliminates need for post-hoc alignment in most cases.
 8. **AdjacencyIndex (CSR) for fast subgraph extraction** — Pre-built at training start. O(batch*k) per step instead of O(E) scanning all ~26M edges.
 9. **Vectorized kNN graph building** — numpy broadcast instead of nested Python loops.
 10. **CosineAnnealingLR T_max floors at 1** — prevents ZeroDivisionError when n_epochs <= warmup_epochs.
 11. **Explicit logger setup** — `StreamHandler(sys.stdout)` on the `spancy` logger, not `logging.basicConfig()`. Ensures output in Colab/Jupyter where root logger is pre-configured.
-12. **train() returns history dict** — tracks loss/recon/contrast/adv/align/lr/grl_lambda per epoch.
+12. **train() returns history dict** — tracks loss/recon/contrast/adv/align/cross_batch/lr/grl_lambda per epoch.
+13. **Cross-batch contrastive loss** — Spatial NT-Xent only pairs within-scene neighbors (same batch). Cross-batch NT-Xent finds phenotype-matched cells across batches (by cosine similarity on X_corrected) and uses them as positives on z_proj. Batch-balanced anchor sampling (512/step), top-5 cross-batch matches per anchor. Direct gradient to pull same-phenotype cells together across batches → improves kBET.
 
 ## Colab Usage
 Both notebooks have Section 0 (Colab Setup) that:
@@ -66,6 +67,6 @@ python spancy.py --input PRAD_anndata.h5ad --output PRAD_normalized.h5ad --epoch
 ## Known Issues / Next Steps
 - Per-sample affine correction + lower-quantile alignment should handle most batch effects. Mode alignment post-hoc available for additional refinement.
 - Training on 1.76M cells takes significant time even with optimizations. Consider reducing epochs for initial testing (`--epochs 10`).
-- Contrastive loss uses spatial-neighbor positives only; cross-batch phenotype-matched positives not yet implemented.
+- Cross-batch contrastive loss now implemented; tune `w_cross_batch` (default 0.5) if kBET vs shape preservation tradeoff needs adjustment.
 - GRL lambda ramps 0→1 over 30 epochs by default.
 - Need to validate with kBET and positive population preservation metrics side-by-side.

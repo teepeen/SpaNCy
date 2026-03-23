@@ -479,6 +479,84 @@ def nt_xent_loss(
     return loss
 
 
+def cross_batch_nt_xent_loss(
+    z_proj: torch.Tensor,
+    X_corrected: torch.Tensor,
+    batch_ids: torch.Tensor,
+    tau: float = 0.1,
+    n_anchors: int = 512,
+    k_positives: int = 5,
+) -> torch.Tensor:
+    """NT-Xent with phenotype-matched cross-batch positives.
+
+    For each anchor cell, finds cells from OTHER batches with the most
+    similar expression profiles (cosine similarity on X_corrected) and
+    uses them as positives in the contrastive loss computed on z_proj.
+
+    This gives direct gradient to pull together cells that share biology
+    but come from different batches — the key signal missing from the
+    spatial-only NT-Xent (which only pairs within-scene neighbors).
+    """
+    n = z_proj.size(0)
+    unique_batches = torch.unique(batch_ids)
+    if unique_batches.size(0) < 2 or n < 10:
+        return torch.tensor(0.0, device=z_proj.device)
+
+    # Sample anchors (balanced across batches)
+    anchor_indices = []
+    per_batch_budget = max(1, n_anchors // unique_batches.size(0))
+    for b in unique_batches:
+        b_mask = (batch_ids == b).nonzero(as_tuple=True)[0]
+        if b_mask.size(0) == 0:
+            continue
+        n_take = min(per_batch_budget, b_mask.size(0))
+        perm = torch.randperm(b_mask.size(0), device=z_proj.device)[:n_take]
+        anchor_indices.append(b_mask[perm])
+    if not anchor_indices:
+        return torch.tensor(0.0, device=z_proj.device)
+    anchors = torch.cat(anchor_indices)  # (A,)
+    n_anchors_actual = anchors.size(0)
+
+    # Expression similarity to find cross-batch phenotype matches
+    X_norm = F.normalize(X_corrected, dim=-1)       # (N, M)
+    anchor_X = X_norm[anchors]                       # (A, M)
+    expr_sim = torch.mm(anchor_X, X_norm.t())        # (A, N)
+
+    # Mask same-batch cells (cannot be cross-batch positives)
+    anchor_batches = batch_ids[anchors]               # (A,)
+    same_batch = anchor_batches.unsqueeze(1) == batch_ids.unsqueeze(0)  # (A, N)
+    expr_sim[same_batch] = -1e9
+
+    # Check that each anchor has at least one cross-batch candidate
+    has_candidates = (expr_sim > -1e8).any(dim=1)
+    if not has_candidates.any():
+        return torch.tensor(0.0, device=z_proj.device)
+    valid = has_candidates.nonzero(as_tuple=True)[0]
+    anchors = anchors[valid]
+    expr_sim = expr_sim[valid]
+    n_anchors_actual = anchors.size(0)
+
+    # Top-k cross-batch phenotype matches per anchor
+    n_cross = (expr_sim > -1e8).sum(dim=1).min().item()
+    k = min(k_positives, max(1, int(n_cross)))
+    _, topk_idx = expr_sim.topk(k, dim=1)            # (A, k)
+
+    # Contrastive loss on z_proj (already L2-normalized)
+    z_anchor = z_proj[anchors]                        # (A, D)
+    z_sim = torch.mm(z_anchor, z_proj.t()) / tau      # (A, N)
+
+    # Mask self from denominator
+    self_mask = torch.zeros(n_anchors_actual, n, dtype=torch.bool, device=z_proj.device)
+    self_mask[torch.arange(n_anchors_actual, device=z_proj.device), anchors] = True
+    z_sim[self_mask] = -1e9
+
+    log_denom = torch.logsumexp(z_sim, dim=-1)       # (A,)
+    pos_sim = z_sim.gather(1, topk_idx)               # (A, k)
+    loss = (-pos_sim + log_denom.unsqueeze(1)).mean()
+
+    return loss
+
+
 def quantile_alignment_loss(
     X_recon: torch.Tensor,
     sample_ids: torch.Tensor,
@@ -689,12 +767,15 @@ def train(
     w_contrast: float = 0.5,
     w_adv: float = 0.3,
     w_align: float = 0.5,
+    w_cross_batch: float = 0.5,
     tau: float = 0.1,
+    cross_batch_anchors: int = 512,
+    cross_batch_k: int = 5,
 ) -> Tuple["SpaNCy", RobustScaler, np.ndarray, Dict[str, List[float]]]:
     """Full training loop. Returns (model, scaler, marker_cycles, history).
 
-    history keys: 'loss', 'recon', 'contrast', 'adv', 'align', 'lr', 'grl_lambda'
-    — one entry per epoch (averaged over steps).
+    history keys: 'loss', 'recon', 'contrast', 'adv', 'align', 'cross_batch',
+    'lr', 'grl_lambda' — one entry per epoch (averaged over steps).
     """
     device = torch.device(device_str)
 
@@ -791,7 +872,7 @@ def train(
 
     history: Dict[str, List[float]] = {
         "loss": [], "recon": [], "contrast": [], "adv": [], "align": [],
-        "lr": [], "grl_lambda": [],
+        "cross_batch": [], "lr": [], "grl_lambda": [],
     }
 
     for epoch in range(n_epochs):
@@ -800,6 +881,7 @@ def train(
         epoch_contrast = 0.0
         epoch_adv = 0.0
         epoch_align = 0.0
+        epoch_cross_batch = 0.0
 
         # GRL lambda ramp
         if epoch < grl_ramp_epochs:
@@ -828,11 +910,16 @@ def train(
             loss_contrast = nt_xent_loss(out["z_proj"], edge_local, tau=tau)
             loss_adv = ce(out["batch_logits"], batch_ids)
             loss_align = quantile_alignment_loss(out["X_recon"], sample_ids)
+            loss_cross = cross_batch_nt_xent_loss(
+                out["z_proj"], out["X_corrected"], batch_ids,
+                tau=tau, n_anchors=cross_batch_anchors, k_positives=cross_batch_k,
+            )
 
             loss = (loss_recon
                     + w_contrast * loss_contrast
                     + w_adv * loss_adv
-                    + w_align * loss_align)
+                    + w_align * loss_align
+                    + w_cross_batch * loss_cross)
 
             optimizer.zero_grad()
             loss.backward()
@@ -844,14 +931,16 @@ def train(
             epoch_contrast += loss_contrast.item()
             epoch_adv += loss_adv.item()
             epoch_align += loss_align.item()
+            epoch_cross_batch += loss_cross.item()
 
             # Per-step progress for long epochs
             if steps_per_epoch > 20 and (step + 1) % max(1, steps_per_epoch // 5) == 0:
                 log.info(
-                    "  Epoch %3d  step %d/%d  loss=%.4f  recon=%.4f  contrast=%.4f  adv=%.4f  align=%.4f",
+                    "  Epoch %3d  step %d/%d  loss=%.4f  recon=%.4f  contrast=%.4f  adv=%.4f  align=%.4f  xbatch=%.4f",
                     epoch + 1, step + 1, steps_per_epoch,
                     loss.item(), loss_recon.item(),
                     loss_contrast.item(), loss_adv.item(), loss_align.item(),
+                    loss_cross.item(),
                 )
 
         scheduler.step()
@@ -863,17 +952,18 @@ def train(
         history["contrast"].append(epoch_contrast / n_steps)
         history["adv"].append(epoch_adv / n_steps)
         history["align"].append(epoch_align / n_steps)
+        history["cross_batch"].append(epoch_cross_batch / n_steps)
         history["lr"].append(optimizer.param_groups[0]["lr"])
         history["grl_lambda"].append(grl_lam)
 
         # Log every epoch (not just every 10th)
         log.info(
             "Epoch %3d/%d  loss=%.4f  recon=%.4f  contrast=%.4f  adv=%.4f  align=%.4f  "
-            "grl=%.2f  lr=%.2e  [%d cells/step]",
+            "xbatch=%.4f  grl=%.2f  lr=%.2e  [%d cells/step]",
             epoch + 1, n_epochs,
             history["loss"][-1], history["recon"][-1],
             history["contrast"][-1], history["adv"][-1],
-            history["align"][-1],
+            history["align"][-1], history["cross_batch"][-1],
             grl_lam, optimizer.param_groups[0]["lr"],
             cells_per_step,
         )
@@ -887,31 +977,82 @@ def train(
 # ──────────────────────────────────────────────────────────────────────────────
 
 
-def _find_negative_peak(counts: np.ndarray, bins: np.ndarray) -> float:
-    """Find the leftmost prominent peak in a histogram.
+def _find_histogram_peaks(
+    counts: np.ndarray,
+    bins: np.ndarray,
+    min_prominence_frac: float = 0.05,
+) -> List[float]:
+    """Find prominent peaks in a histogram, ordered left to right.
 
-    For CyCIF markers, the leftmost peak is always the negative/background
-    population.  This is the correct reference for alignment — even when the
-    positive population peak is taller (e.g. ECAD in epithelial-rich samples).
+    Returns a list of peak positions (bin centers).  For CyCIF markers:
+    - peaks[0] = negative/background population (always leftmost)
+    - peaks[1] = positive population (if bimodal)
 
     Uses Gaussian smoothing + scipy peak detection with prominence filtering.
     """
     counts_smooth = gaussian_filter1d(counts.astype(np.float64), sigma=2)
     max_height = counts_smooth.max()
     if max_height < 1:
-        # Empty histogram — return midpoint
-        return (bins[0] + bins[-1]) / 2
+        return [(bins[0] + bins[-1]) / 2]
 
-    # Find peaks with at least 5% of max height as prominence
-    peaks, _ = find_peaks(counts_smooth, prominence=max_height * 0.05)
-    if len(peaks) > 0:
-        # Leftmost prominent peak = negative population
-        idx = peaks[0]
-    else:
-        # Fallback: global maximum
+    peaks, properties = find_peaks(
+        counts_smooth, prominence=max_height * min_prominence_frac
+    )
+    if len(peaks) == 0:
         idx = int(counts_smooth.argmax())
+        return [(bins[idx] + bins[idx + 1]) / 2]
 
-    return (bins[idx] + bins[idx + 1]) / 2
+    return [(bins[p] + bins[p + 1]) / 2 for p in peaks]
+
+
+def _piecewise_linear_transform(
+    vals: np.ndarray,
+    src_anchors: List[float],
+    dst_anchors: List[float],
+) -> np.ndarray:
+    """Apply piecewise linear transform mapping src_anchors → dst_anchors.
+
+    - Below the first anchor: shifted by (dst[0] - src[0]) (pure translation)
+    - Between anchors: linearly interpolated scale+shift
+    - Above the last anchor: scaled using the last segment's slope
+    """
+    out = vals.copy()
+    if len(src_anchors) == 1 or len(dst_anchors) == 1:
+        # Single anchor: pure shift
+        shift = dst_anchors[0] - src_anchors[0]
+        return out + shift
+
+    # Two or more anchors: piecewise linear
+    n_seg = min(len(src_anchors), len(dst_anchors))
+
+    # Below first anchor: pure shift
+    mask_below = vals <= src_anchors[0]
+    out[mask_below] = vals[mask_below] + (dst_anchors[0] - src_anchors[0])
+
+    # Between anchors
+    for i in range(n_seg - 1):
+        s0, s1 = src_anchors[i], src_anchors[i + 1]
+        d0, d1 = dst_anchors[i], dst_anchors[i + 1]
+        src_span = s1 - s0
+        if src_span < 1e-8:
+            continue
+        dst_span = d1 - d0
+        scale = dst_span / src_span
+        mask_seg = (vals > s0) & (vals <= s1)
+        out[mask_seg] = d0 + (vals[mask_seg] - s0) * scale
+
+    # Above last anchor: extrapolate with last segment's slope
+    s_last0, s_last1 = src_anchors[n_seg - 2], src_anchors[n_seg - 1]
+    d_last0, d_last1 = dst_anchors[n_seg - 2], dst_anchors[n_seg - 1]
+    src_span = s_last1 - s_last0
+    if src_span > 1e-8:
+        scale = (d_last1 - d_last0) / src_span
+    else:
+        scale = 1.0
+    mask_above = vals > src_anchors[n_seg - 1]
+    out[mask_above] = d_last1 + (vals[mask_above] - s_last1) * scale
+
+    return out
 
 
 def sample_mode_align(
@@ -919,17 +1060,21 @@ def sample_mode_align(
     sample_ids: np.ndarray,
     n_bins: int = 200,
 ) -> np.ndarray:
-    """Per-marker, per-sample negative-population peak alignment.
+    """Per-marker, per-sample piecewise peak alignment.
 
-    For each marker, finds the **leftmost prominent peak** (negative/background
-    population) in each sample's distribution and shifts it to match the
-    global negative peak.  This is a pure translation — no scaling, no shape
-    distortion.
+    For each marker, detects peaks (negative and, if bimodal, positive) in
+    each sample and in the global distribution, then applies a piecewise
+    linear transform that maps each sample's peaks to the global peaks.
 
-    Unlike simple argmax mode-finding, this correctly handles bimodal markers
-    (e.g. ECAD, CD45) where the positive population peak can be *taller* than
-    the negative peak in samples with many positive cells.  The leftmost peak
-    is always the negative population regardless of positive cell fraction.
+    - **Unimodal markers**: Pure shift (same as before — aligns the single peak).
+    - **Bimodal markers** (e.g. ECAD, CD45): Aligns BOTH the negative peak AND
+      the positive peak via a piecewise linear transform.  This corrects nonlinear
+      batch effects where the dynamic range (distance between peaks) varies across
+      samples — a pure shift would leave the positive peaks misaligned.
+
+    The piecewise linear transform preserves distribution shape within each
+    segment (below negative peak, between peaks, above positive peak) while
+    correctly aligning both anchor points.
 
     Args:
         X: (N, M) expression matrix (in log space).
@@ -946,15 +1091,16 @@ def sample_mode_align(
 
     for m in range(n_markers):
         col = X[:, m]
-        # Use global percentile range for consistent binning across samples
         lo, hi = np.percentile(col, [1, 99])
         if hi - lo < 1e-6:
             continue
         bins = np.linspace(lo, hi, n_bins + 1)
 
-        # Global negative peak
+        # Global peaks
         counts_global, _ = np.histogram(col, bins=bins)
-        global_peak = _find_negative_peak(counts_global, bins)
+        global_peaks = _find_histogram_peaks(counts_global, bins)
+        # Use at most 2 peaks (negative + positive)
+        global_peaks = global_peaks[:2]
 
         for s in unique_samples:
             mask = sample_ids == s
@@ -962,8 +1108,15 @@ def sample_mode_align(
             if len(vals) < 50:
                 continue
             counts_s, _ = np.histogram(vals, bins=bins)
-            sample_peak = _find_negative_peak(counts_s, bins)
-            X_aligned[mask, m] = vals - sample_peak + global_peak
+            sample_peaks = _find_histogram_peaks(counts_s, bins)
+            sample_peaks = sample_peaks[:2]
+
+            # Match the number of anchors: use min of detected peaks
+            n_anchors = min(len(global_peaks), len(sample_peaks))
+            src = sample_peaks[:n_anchors]
+            dst = global_peaks[:n_anchors]
+
+            X_aligned[mask, m] = _piecewise_linear_transform(vals, src, dst)
 
     return X_aligned
 
@@ -1174,7 +1327,10 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p.add_argument("--w_contrast", type=float, default=0.5, help="Contrastive loss weight (default: 0.5)")
     p.add_argument("--w_adv", type=float, default=0.3, help="Adversarial loss weight (default: 0.3)")
     p.add_argument("--w_align", type=float, default=0.5, help="Quantile alignment weight (default: 0.5)")
+    p.add_argument("--w_cross_batch", type=float, default=0.5, help="Cross-batch contrastive weight (default: 0.5)")
     p.add_argument("--tau", type=float, default=0.1, help="NT-Xent temperature (default: 0.1)")
+    p.add_argument("--cross_batch_anchors", type=int, default=512, help="Anchor cells per step for cross-batch contrastive (default: 512)")
+    p.add_argument("--cross_batch_k", type=int, default=5, help="Cross-batch positives per anchor (default: 5)")
     return p.parse_args(argv)
 
 
@@ -1213,7 +1369,10 @@ def main(argv: Optional[List[str]] = None) -> None:
         w_contrast=args.w_contrast,
         w_adv=args.w_adv,
         w_align=args.w_align,
+        w_cross_batch=args.w_cross_batch,
         tau=args.tau,
+        cross_batch_anchors=args.cross_batch_anchors,
+        cross_batch_k=args.cross_batch_k,
     )
 
     adata = normalize_adata(
