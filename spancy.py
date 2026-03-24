@@ -977,10 +977,10 @@ def train(
 # ──────────────────────────────────────────────────────────────────────────────
 
 
-def _find_histogram_peaks(
+def _find_peaks(
     counts: np.ndarray,
     bins: np.ndarray,
-    min_prominence_frac: float = 0.05,
+    min_prominence_frac: float = 0.02,
 ) -> List[float]:
     """Find prominent peaks in a histogram, ordered left to right.
 
@@ -995,7 +995,7 @@ def _find_histogram_peaks(
     if max_height < 1:
         return [(bins[0] + bins[-1]) / 2]
 
-    peaks, properties = find_peaks(
+    peaks, _ = find_peaks(
         counts_smooth, prominence=max_height * min_prominence_frac
     )
     if len(peaks) == 0:
@@ -1005,52 +1005,45 @@ def _find_histogram_peaks(
     return [(bins[p] + bins[p + 1]) / 2 for p in peaks]
 
 
-def _piecewise_linear_transform(
+def _safe_piecewise_transform(
     vals: np.ndarray,
-    src_anchors: List[float],
-    dst_anchors: List[float],
+    src_peaks: List[float],
+    dst_peaks: List[float],
 ) -> np.ndarray:
-    """Apply piecewise linear transform mapping src_anchors → dst_anchors.
+    """Piecewise linear transform with clamped extrapolation (slope=1).
 
-    - Below the first anchor: shifted by (dst[0] - src[0]) (pure translation)
-    - Between anchors: linearly interpolated scale+shift
-    - Above the last anchor: scaled using the last segment's slope
+    - Below the negative peak: pure shift by (dst[0] - src[0])
+    - Between negative and positive peaks: linearly scaled to map
+      src gap → dst gap (this corrects dynamic range differences)
+    - Above the positive peak: pure shift by (dst[1] - src[1]),
+      NOT scaled — avoids tail stretching
+
+    Only called when both src and dst have exactly 2 peaks.
     """
+    s0, s1 = src_peaks[0], src_peaks[1]
+    d0, d1 = dst_peaks[0], dst_peaks[1]
+
     out = vals.copy()
-    if len(src_anchors) == 1 or len(dst_anchors) == 1:
-        # Single anchor: pure shift
-        shift = dst_anchors[0] - src_anchors[0]
-        return out + shift
 
-    # Two or more anchors: piecewise linear
-    n_seg = min(len(src_anchors), len(dst_anchors))
+    # Below negative peak: pure shift
+    mask_below = vals <= s0
+    out[mask_below] = vals[mask_below] + (d0 - s0)
 
-    # Below first anchor: pure shift
-    mask_below = vals <= src_anchors[0]
-    out[mask_below] = vals[mask_below] + (dst_anchors[0] - src_anchors[0])
-
-    # Between anchors
-    for i in range(n_seg - 1):
-        s0, s1 = src_anchors[i], src_anchors[i + 1]
-        d0, d1 = dst_anchors[i], dst_anchors[i + 1]
-        src_span = s1 - s0
-        if src_span < 1e-8:
-            continue
-        dst_span = d1 - d0
-        scale = dst_span / src_span
-        mask_seg = (vals > s0) & (vals <= s1)
-        out[mask_seg] = d0 + (vals[mask_seg] - s0) * scale
-
-    # Above last anchor: extrapolate with last segment's slope
-    s_last0, s_last1 = src_anchors[n_seg - 2], src_anchors[n_seg - 1]
-    d_last0, d_last1 = dst_anchors[n_seg - 2], dst_anchors[n_seg - 1]
-    src_span = s_last1 - s_last0
+    # Between peaks: scale to match dynamic range
+    src_span = s1 - s0
+    dst_span = d1 - d0
     if src_span > 1e-8:
-        scale = (d_last1 - d_last0) / src_span
+        scale = dst_span / src_span
+        mask_mid = (vals > s0) & (vals <= s1)
+        out[mask_mid] = d0 + (vals[mask_mid] - s0) * scale
     else:
-        scale = 1.0
-    mask_above = vals > src_anchors[n_seg - 1]
-    out[mask_above] = d_last1 + (vals[mask_above] - s_last1) * scale
+        # Degenerate: peaks overlap, just shift
+        mask_mid = (vals > s0) & (vals <= s1)
+        out[mask_mid] = vals[mask_mid] + (d0 - s0)
+
+    # Above positive peak: pure shift (slope=1, NOT scaled)
+    mask_above = vals > s1
+    out[mask_above] = vals[mask_above] + (d1 - s1)
 
     return out
 
@@ -1059,27 +1052,26 @@ def sample_mode_align(
     X: np.ndarray,
     sample_ids: np.ndarray,
     n_bins: int = 200,
+    marker_names: Optional[List[str]] = None,
 ) -> np.ndarray:
-    """Per-marker, per-sample piecewise peak alignment.
+    """Per-marker, per-sample peak alignment with safe piecewise correction.
 
-    For each marker, detects peaks (negative and, if bimodal, positive) in
-    each sample and in the global distribution, then applies a piecewise
-    linear transform that maps each sample's peaks to the global peaks.
+    For each marker, detects peaks in global and per-sample distributions:
 
-    - **Unimodal markers**: Pure shift (same as before — aligns the single peak).
-    - **Bimodal markers** (e.g. ECAD, CD45): Aligns BOTH the negative peak AND
-      the positive peak via a piecewise linear transform.  This corrects nonlinear
-      batch effects where the dynamic range (distance between peaks) varies across
-      samples — a pure shift would leave the positive peaks misaligned.
-
-    The piecewise linear transform preserves distribution shape within each
-    segment (below negative peak, between peaks, above positive peak) while
-    correctly aligning both anchor points.
+    - **Unimodal** (1 peak in global or sample): Pure shift aligning the
+      leftmost (negative) peak.  No scaling, no shape distortion.
+    - **Bimodal** (2+ peaks in BOTH global and sample): Piecewise linear
+      transform that aligns both negative and positive peaks.  Between
+      the peaks, values are linearly scaled to match the global dynamic
+      range.  Beyond the positive peak, a pure shift is applied (slope=1)
+      — this avoids the tail-stretching artifact that occurs when the
+      inter-peak scale factor is extrapolated into the tail.
 
     Args:
         X: (N, M) expression matrix (in log space).
         sample_ids: (N,) per-cell sample labels.
         n_bins: Number of histogram bins for peak estimation.
+        marker_names: Optional list of marker names for logging.
 
     Returns:
         X_aligned: (N, M) peak-aligned expression matrix.
@@ -1091,6 +1083,7 @@ def sample_mode_align(
 
     for m in range(n_markers):
         col = X[:, m]
+        # Use global percentile range for consistent binning across samples
         lo, hi = np.percentile(col, [1, 99])
         if hi - lo < 1e-6:
             continue
@@ -1098,9 +1091,10 @@ def sample_mode_align(
 
         # Global peaks
         counts_global, _ = np.histogram(col, bins=bins)
-        global_peaks = _find_histogram_peaks(counts_global, bins)
-        # Use at most 2 peaks (negative + positive)
-        global_peaks = global_peaks[:2]
+        global_peaks = _find_peaks(counts_global, bins)
+
+        n_piecewise = 0
+        n_shift = 0
 
         for s in unique_samples:
             mask = sample_ids == s
@@ -1108,15 +1102,26 @@ def sample_mode_align(
             if len(vals) < 50:
                 continue
             counts_s, _ = np.histogram(vals, bins=bins)
-            sample_peaks = _find_histogram_peaks(counts_s, bins)
-            sample_peaks = sample_peaks[:2]
+            sample_peaks = _find_peaks(counts_s, bins)
 
-            # Match the number of anchors: use min of detected peaks
-            n_anchors = min(len(global_peaks), len(sample_peaks))
-            src = sample_peaks[:n_anchors]
-            dst = global_peaks[:n_anchors]
+            if len(global_peaks) >= 2 and len(sample_peaks) >= 2:
+                # Both bimodal: piecewise alignment of first two peaks
+                X_aligned[mask, m] = _safe_piecewise_transform(
+                    vals, sample_peaks[:2], global_peaks[:2],
+                )
+                n_piecewise += 1
+            else:
+                # Unimodal fallback: pure shift on leftmost peak
+                shift = global_peaks[0] - sample_peaks[0]
+                X_aligned[mask, m] = vals + shift
+                n_shift += 1
 
-            X_aligned[mask, m] = _piecewise_linear_transform(vals, src, dst)
+        n_total = n_piecewise + n_shift
+        mname = marker_names[m] if marker_names and m < len(marker_names) else str(m)
+        log.info(
+            "  %-10s: global_peaks=%d, piecewise=%d/%d, shift=%d/%d",
+            mname, len(global_peaks), n_piecewise, n_total, n_shift, n_total,
+        )
 
     return X_aligned
 
@@ -1272,7 +1277,10 @@ def normalize_adata(
                     "across %d samples (col='%s')...",
                     n_unique, s_col,
                 )
-                X_norm_log = sample_mode_align(X_norm_log, sample_ids)
+                mnames = list(adata.var_names) if adata is not None else None
+                X_norm_log = sample_mode_align(
+                    X_norm_log, sample_ids, marker_names=mnames,
+                )
             else:
                 log.info("Only 1 sample found — skipping sample alignment.")
         else:
