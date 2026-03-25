@@ -416,12 +416,23 @@ class SpaNCy(nn.Module):
         batch_ids: torch.Tensor,
         sample_ids: torch.Tensor,
         marker_cycles: torch.Tensor,
+        alpha: float = 1.0,
     ) -> torch.Tensor:
+        """Inference: affine correction + scaled residual delta.
+
+        Args:
+            alpha: Blending weight for the GNN residual delta.
+                   1.0 = full residual (original behavior).
+                   0.0 = pure affine correction.
+                   0.3 = hybrid (gentle multivariate nudge).
+        """
         self.eval()
         X_corrected = self.cycle_model.correct(X, batch_ids, sample_ids, marker_cycles)
+        if alpha == 0.0:
+            return X_corrected
         z = self.encoder(X_corrected, edge_index)
         delta = self.decoder(z)
-        return X_corrected + delta
+        return X_corrected + alpha * delta
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -1143,6 +1154,7 @@ def normalize_adata(
     mode: str = "affine",
     align_samples: bool = False,
     sample_col: str = "sample_id",
+    hybrid_alpha: float = 0.3,
 ) -> ad.AnnData:
     """Run inference and store results in adata.layers['normalized'].
 
@@ -1157,6 +1169,10 @@ def normalize_adata(
             "residual" — Full pipeline: affine correction + GNN encoder → residual
                          decoder.  Better batch alignment (kBET) but may distort
                          distribution shape.
+            "hybrid"   — Affine correction + scaled GNN residual delta.
+                         X_out = X_corrected + hybrid_alpha * delta.
+                         Balances shape preservation with multivariate alignment.
+                         alpha=0 is pure affine, alpha=1 is full residual.
         align_samples: If True, apply post-hoc per-marker, per-sample
             mode (histogram peak) alignment after the primary correction.
             For each marker, each sample's dominant peak is shifted to match
@@ -1167,6 +1183,8 @@ def normalize_adata(
             handles this; enable for additional refinement.
         sample_col: obs column identifying individual samples for alignment.
             Default "sample_id".
+        hybrid_alpha: Blending weight for hybrid mode (default 0.3).
+            0 = pure affine, 1 = full residual. Only used when mode="hybrid".
     """
     device = torch.device(device_str)
     model = model.to(device)
@@ -1222,12 +1240,15 @@ def normalize_adata(
                 log.info("Inference chunk %d/%d", chunk_i + 1,
                          max(1, math.ceil(n_cells / inference_batch_size)))
 
-    elif mode == "residual":
-        # ── Full pipeline: affine + GNN + residual decoder ──────────────
+    elif mode in ("residual", "hybrid"):
+        # ── GNN pipeline: affine + scaled residual delta ─────────────────
+        # residual: alpha=1.0 (full delta)
+        # hybrid:   alpha=hybrid_alpha (default 0.3, gentle multivariate nudge)
+        alpha = hybrid_alpha if mode == "hybrid" else 1.0
         coords = get_spatial_coords(adata)
         scene_ids = get_scene_ids(adata)
 
-        log.info("Normalizing with full residual pipeline...")
+        log.info("Normalizing with %s pipeline (alpha=%.2f)...", mode, alpha)
         log.info("Building inference spatial graph...")
         edge_index_np = build_knn_graph(coords, scene_ids, k=k_neighbors)
 
@@ -1246,13 +1267,16 @@ def normalize_adata(
             batch_chunk = batch_all[idx].to(device)
             sample_chunk = sample_all[idx].to(device)
 
-            X_out = model.normalize(X_chunk, edge_local, batch_chunk, sample_chunk, marker_cycles_t)
+            X_out = model.normalize(
+                X_chunk, edge_local, batch_chunk, sample_chunk,
+                marker_cycles_t, alpha=alpha,
+            )
             X_norm_scaled[start:end] = X_out.cpu().numpy()
 
             if (chunk_i + 1) % 10 == 0 or chunk_i == 0:
                 log.info("Inference chunk %d/%d", chunk_i + 1, n_chunks)
     else:
-        raise ValueError(f"Unknown mode '{mode}'. Use 'affine' or 'residual'.")
+        raise ValueError(f"Unknown mode '{mode}'. Use 'affine', 'residual', or 'hybrid'.")
 
     # Inverse transform: unscale → log space
     X_norm_log = scaler.inverse_transform(X_norm_scaled)
@@ -1289,6 +1313,18 @@ def normalize_adata(
                 "(tried: %s, sample, Sample, patient_id). Skipping.",
                 sample_col,
             )
+
+    # Clamp log-space values to the plausible range before expm1.
+    # The raw data in log1p space is typically in [0, ~14] for CyCIF.
+    # Extreme values here mean the affine correction overshot — cap them
+    # rather than letting expm1 produce astronomical numbers.
+    raw_log_max = np.log1p(np.clip(np.asarray(adata.X.toarray() if sp.issparse(adata.X) else adata.X), 0, None)).max()
+    log_cap = max(raw_log_max * 1.2, 15.0)  # 20% headroom above raw max
+    n_capped = (X_norm_log > log_cap).sum()
+    if n_capped > 0:
+        log.info("Capping %d values (%.4f%%) exceeding log-space max %.2f",
+                 n_capped, 100 * n_capped / X_norm_log.size, log_cap)
+    X_norm_log = np.clip(X_norm_log, None, log_cap)
 
     # expm1 inverts log1p; clip at 0 (physical constraint)
     X_norm = np.expm1(X_norm_log)
