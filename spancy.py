@@ -1341,6 +1341,209 @@ def normalize_adata(
     return adata
 
 
+@torch.no_grad()
+def normalize_adata_ensemble(
+    adata: ad.AnnData,
+    models: List[SpaNCy],
+    scalers: List[RobustScaler],
+    marker_cycles: np.ndarray,
+    k_neighbors: int = 15,
+    device_str: str = "cpu",
+    inference_batch_size: int = 50000,
+    mode: str = "hybrid",
+    align_samples: bool = False,
+    sample_col: str = "sample_id",
+    hybrid_alpha: float = 0.3,
+    layer_name: str = "ensemble_normalized",
+) -> ad.AnnData:
+    """Ensemble inference: average corrections across multiple trained models.
+
+    For affine mode, averages gamma/beta across models.
+    For hybrid/residual modes, each model computes its own full correction
+    path (its own gamma/beta + its own GNN delta), then the final outputs
+    are averaged.  This ensures each GNN encoder sees the X_corrected
+    distribution it was trained on, producing stronger deltas.
+
+    Args:
+        models: List of trained SpaNCy models from ensemble training.
+        scalers: List of RobustScalers (one per model). The first is used
+                 for transform/inverse_transform; all should be similar since
+                 they're fit on the same data.
+        mode: "affine" (averaged gamma/beta only), "hybrid" (+ scaled avg delta),
+              or "residual" (+ full avg delta).
+        hybrid_alpha: Blending weight for GNN delta within each model (default 0.3).
+        layer_name: Where to store result in adata.layers (default 'ensemble_normalized').
+    """
+    assert len(models) >= 1, "Need at least one model"
+    assert len(models) == len(scalers), "models and scalers must have same length"
+    n_models = len(models)
+
+    device = torch.device(device_str)
+    for m in models:
+        m.to(device)
+        m.eval()
+
+    # Use first scaler for transform (all fit on same data)
+    scaler = scalers[0]
+
+    X_raw = np.asarray(adata.X)
+    if sp.issparse(adata.X):
+        X_raw = adata.X.toarray()
+
+    X_log = np.log1p(np.clip(X_raw, 0, None))
+    X_scaled = scaler.transform(X_log).astype(np.float32)
+
+    batch_cats = adata.obs["batch"].astype("category")
+    batch_codes = batch_cats.cat.codes.values.astype(np.int64)
+
+    s_col = None
+    for col in (sample_col, "sample_id", "sample", "Sample", "patient_id", "patient"):
+        if col in adata.obs.columns:
+            s_col = col
+            break
+    if s_col is None:
+        s_col = "batch"
+    sample_cats = adata.obs[s_col].astype("category")
+    sample_codes = sample_cats.cat.codes.values.astype(np.int64)
+
+    marker_cycles_t = torch.tensor(marker_cycles, dtype=torch.long, device=device)
+    X_all = torch.tensor(X_scaled, dtype=torch.float32)
+    batch_all = torch.tensor(batch_codes, dtype=torch.long)
+    sample_all = torch.tensor(sample_codes, dtype=torch.long)
+
+    n_cells = adata.n_obs
+    n_markers = adata.n_vars
+    X_norm_scaled = np.zeros((n_cells, n_markers), dtype=np.float32)
+
+    if mode == "affine":
+        # ── Ensemble affine: average gamma/beta across models ────────────
+        log.info("Ensemble normalizing (%d models) with affine-only correction...", n_models)
+
+        for chunk_i in range(max(1, math.ceil(n_cells / inference_batch_size))):
+            start = chunk_i * inference_batch_size
+            end = min(start + inference_batch_size, n_cells)
+
+            X_chunk = X_all[start:end].to(device)
+            batch_chunk = batch_all[start:end].to(device)
+            sample_chunk = sample_all[start:end].to(device)
+
+            # Average gamma/beta across ensemble
+            gamma_sum = torch.zeros(end - start, n_markers, device=device)
+            beta_sum = torch.zeros(end - start, n_markers, device=device)
+            for m in models:
+                g, b = m.cycle_model(batch_chunk, sample_chunk, marker_cycles_t)
+                gamma_sum += g
+                beta_sum += b
+            gamma_avg = gamma_sum / n_models
+            beta_avg = beta_sum / n_models
+
+            X_out = (X_chunk - beta_avg) / gamma_avg
+            X_norm_scaled[start:end] = X_out.cpu().numpy()
+
+            if (chunk_i + 1) % 10 == 0 or chunk_i == 0:
+                log.info("Inference chunk %d/%d", chunk_i + 1,
+                         max(1, math.ceil(n_cells / inference_batch_size)))
+
+    elif mode in ("residual", "hybrid"):
+        # ── Ensemble hybrid/residual: per-model full correction, then average ─
+        # Each model computes its OWN X_corrected (from its own gamma/beta)
+        # and its OWN delta (from its GNN trained on that X_corrected).
+        # Final output = mean_i( X_corrected_i + alpha * delta_i ).
+        # This avoids distribution mismatch: each GNN sees what it trained on.
+        alpha = hybrid_alpha if mode == "hybrid" else 1.0
+        coords = get_spatial_coords(adata)
+        scene_ids = get_scene_ids(adata)
+
+        log.info(
+            "Ensemble normalizing (%d models) with %s pipeline (alpha=%.2f)...",
+            n_models, mode, alpha,
+        )
+        log.info("Building inference spatial graph...")
+        edge_index_np = build_knn_graph(coords, scene_ids, k=k_neighbors)
+
+        all_indices = np.arange(n_cells)
+        n_chunks = max(1, math.ceil(n_cells / inference_batch_size))
+
+        for chunk_i in range(n_chunks):
+            start = chunk_i * inference_batch_size
+            end = min(start + inference_batch_size, n_cells)
+            idx = all_indices[start:end]
+
+            edge_local, _ = build_subgraph(edge_index_np, idx)
+            edge_local = edge_local.to(device)
+
+            X_chunk = X_all[idx].to(device)
+            batch_chunk = batch_all[idx].to(device)
+            sample_chunk = sample_all[idx].to(device)
+
+            # Each model: own affine correction → own GNN delta → own output
+            output_sum = torch.zeros(end - start, n_markers, device=device)
+            for m in models:
+                X_corrected_i = m.cycle_model.correct(
+                    X_chunk, batch_chunk, sample_chunk, marker_cycles_t,
+                )
+                z_i = m.encoder(X_corrected_i, edge_local)
+                delta_i = m.decoder(z_i)
+                output_sum += X_corrected_i + alpha * delta_i
+
+            X_out = output_sum / n_models
+            X_norm_scaled[start:end] = X_out.cpu().numpy()
+
+            if (chunk_i + 1) % 10 == 0 or chunk_i == 0:
+                log.info("Inference chunk %d/%d", chunk_i + 1, n_chunks)
+    else:
+        raise ValueError(f"Unknown mode '{mode}'. Use 'affine', 'residual', or 'hybrid'.")
+
+    # Inverse transform: unscale → log space
+    X_norm_log = scaler.inverse_transform(X_norm_scaled)
+
+    # Per-sample mode alignment in log space
+    if align_samples:
+        s_col_align = None
+        for col in (sample_col, "sample", "Sample", "patient_id", "patient"):
+            if col in adata.obs.columns:
+                s_col_align = col
+                break
+        if s_col_align is not None:
+            sample_ids = adata.obs[s_col_align].values
+            n_unique = len(np.unique(sample_ids))
+            if n_unique > 1:
+                log.info(
+                    "Applying per-sample mode alignment in log space "
+                    "across %d samples (col='%s')...",
+                    n_unique, s_col_align,
+                )
+                mnames = list(adata.var_names) if adata is not None else None
+                X_norm_log = sample_mode_align(
+                    X_norm_log, sample_ids, marker_names=mnames,
+                )
+
+    # Log-space cap
+    raw_log_max = np.log1p(np.clip(np.asarray(
+        adata.X.toarray() if sp.issparse(adata.X) else adata.X
+    ), 0, None)).max()
+    log_cap = max(raw_log_max * 1.2, 15.0)
+    n_capped = (X_norm_log > log_cap).sum()
+    if n_capped > 0:
+        log.info("Capping %d values (%.4f%%) exceeding log-space max %.2f",
+                 n_capped, 100 * n_capped / X_norm_log.size, log_cap)
+    X_norm_log = np.clip(X_norm_log, None, log_cap)
+
+    # expm1 inverts log1p; clip at 0
+    X_norm = np.expm1(X_norm_log)
+    X_norm = np.clip(X_norm, 0, None)
+
+    adata.layers[layer_name] = X_norm
+    log.info(
+        "Ensemble normalization complete [%d models, mode=%s, alpha=%.2f]. "
+        "Stored in adata.layers['%s'] "
+        "(min=%.4f, max=%.4f, mean=%.4f)",
+        n_models, mode, alpha if mode != "affine" else 0.0, layer_name,
+        X_norm.min(), X_norm.max(), X_norm.mean(),
+    )
+    return adata
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # CLI
 # ──────────────────────────────────────────────────────────────────────────────

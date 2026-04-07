@@ -22,6 +22,7 @@ X_raw + batch_id + (x,y) → CycleDegradationModel → SpatialGNNEncoder (GATv2)
 2. **Hybrid** (`mode="hybrid"`, default recommended): Affine correction + **scaled GNN residual delta**: `X_out = X_corrected + alpha * delta`. The `hybrid_alpha` parameter (default 0.3) controls the trade-off: 0=pure affine, 1=full residual. Gives multivariate alignment (improves kBET) while mostly preserving distribution shapes.
 3. **Residual** (`mode="residual"`): Full pipeline with alpha=1.0. Best kBET but may distort distribution shapes.
 4. **Per-sample mode alignment** (`align_samples=True`): Post-hoc step for any mode. For each marker, finds the histogram peak (mode) in each sample and shifts to match the global peak. Robust to bimodal markers (e.g. ECAD).
+5. **Ensemble hybrid** (`normalize_adata_ensemble()`, `mode="hybrid"`): Averages gamma/beta AND GNN deltas across N ensemble models. Combines histogram stability of ensemble averaging with multivariate correction for kBET. Best of both worlds.
 
 **Log-space cap**: Before expm1, values are clamped to 1.2x the raw data maximum in log1p space. Prevents astronomical output values from overcorrected gamma/beta.
 
@@ -59,6 +60,7 @@ X_raw + batch_id + (x,y) → CycleDegradationModel → SpatialGNNEncoder (GATv2)
 16. **DO NOT put alignment loss on X_corrected** — Tried 3 times with different regularization strategies; all caused gamma/beta explosion because recon loss `huber(X_recon, X_corrected)` has no anchor to original data. Keep alignment on `X_recon` only (indirect gradient through GNN).
 17. **DBnorm-inspired ensemble** — Train N models with diverse hyperparameters (varying LR, loss weights, k-neighbors), average gamma/beta at inference. Inspired by BER-Bagging (Bararpour et al., Sci Rep 2021). Stabilizes corrections.
 18. **Per-marker batch adj-R²** — Regress each marker on batch labels (one-hot). Simple diagnostic: high adj-R² after correction = that marker still has residual batch effect.
+19. **Ensemble hybrid inference** (`normalize_adata_ensemble()`) — Each model computes its own full correction path (own gamma/beta → own GNN delta), then final outputs are averaged: `mean_i(X_corrected_i + alpha * delta_i)`. Critical: each GNN must see the X_corrected it was trained on (not an ensemble-averaged X_corrected) for strong deltas. First attempt with shared X_corrected gave weaker results due to distribution mismatch.
 
 ## Colab Usage
 Both notebooks have Section 0 (Colab Setup) that:
@@ -71,17 +73,36 @@ Both notebooks have Section 0 (Colab Setup) that:
 python spancy.py --input PRAD_anndata.h5ad --output PRAD_normalized.h5ad --epochs 100 --device cuda
 ```
 
+## Results So Far (2026-04-07)
+
+### Batch adj-R² (lower = better, less batch effect)
+| Method | Mean adj-R² | Notes |
+|--------|-------------|-------|
+| Raw | 0.259 | Baseline |
+| Single model (affine) | 0.247 | Barely improves; some markers WORSE (ChromA 0.10→0.41, CD20 0.47→0.68) |
+| Ensemble 3x (affine) | **0.044** | 83% reduction. Nearly every marker below 0.05. |
+
+Ensemble outliers: Ki67 (0.13), NOTCH1 (0.24), FOXA1 (0.10) still have residual batch effect.
+
+### kBET (higher = better, batches well-mixed) — first ensemble hybrid run (shared X_corrected, now fixed)
+| Method | Mean kBET | Mean chi² |
+|--------|-----------|-----------|
+| Single model (affine) | 0.176 | 24.9 |
+| Ensemble affine | 0.418 | 15.8 |
+| Ensemble hybrid a0.2 | 0.574 | 13.9 |
+
+**Pending**: Re-running kBET with per-model correction path fix (each GNN sees its own X_corrected). Results expected to improve further.
+
 ## Known Issues / Next Steps
-- **Hybrid mode needs validation** — `mode="hybrid"` with `alpha=0.3` is the recommended default; tune alpha (0.1–0.5) based on kBET vs shape preservation.
+- **Ensemble hybrid kBET re-run pending** — per-model correction paths should give stronger GNN deltas. Testing alpha range 0.1–1.0.
+- Ki67, NOTCH1, FOXA1 have residual batch effect even with ensemble — may need more models (5 instead of 3) or more epochs.
+- g5 group sometimes returns NaN in kBET — numerical instability in pegasus, now handled with NaN detection.
 - Training on 1.76M cells takes significant time. Use `--epochs 10` for testing, `--epochs 100` for production.
-- Cross-batch contrastive loss: tune `w_cross_batch` (default 0.5) if kBET vs shape preservation tradeoff needs adjustment.
 - GRL lambda ramps 0→1 over 30 epochs by default.
-- kBET baseline (affine-only, 10 epochs): g1=0.88, g2=0.55, g3=0.19, g4=0.10, g5=0.53. Higher=better.
-- Ensemble mode in `db_spancy_explore.ipynb` trains 3 models with diverse hyperparams; needs comparison with hybrid mode.
 
 ## kBET Metric Notes
 - **Higher kBET acceptance rate = better** (batches well-mixed in local neighborhoods)
 - **Lower chi-square = better**
 - **Higher p-value = better**
 - kBET operates in full 20D expression space — aligned 1D marginal histograms do NOT guarantee good kBET
-- Computed on 5 clinical groups pairing samples from different batches
+- Computed on 5 clinical groups pairing samples from different batches (rep="umap")
