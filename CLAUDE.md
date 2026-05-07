@@ -29,11 +29,14 @@ X_raw + batch_id + (x,y) → CycleDegradationModel → SpatialGNNEncoder (GATv2)
 ## Files
 | File | Purpose |
 |------|---------|
-| `spancy.py` | Full implementation (~1100 lines): models, training, inference, CLI |
+| `spancy.py` | Full GNN implementation (~1100 lines): models, training, inference, CLI |
 | `requirements.txt` | Dependencies: torch, torch-geometric, anndata, numpy, scipy, scikit-learn |
 | `spancy_explore.ipynb` | Dev/exploration notebook — step through pipeline interactively |
 | `spancy_demo.ipynb` | Demo/tutorial — run SpaNCy, UMAP before/after, KS statistics |
 | `db_spancy_explore.ipynb` | DBnorm-inspired notebook — per-marker R², ensemble training, single vs ensemble comparison, histogram PDF |
+| `spancy-flow/` | **Alternative approach**: Normalizing flow + MMD loss (see `spancy-flow/CLAUDE.md`) |
+| `spancy-flow/spancy_flow.py` | Flow implementation (~1480 lines): CycleBlockFlow, MMD loss, training, inference |
+| `spancy-flow/MMD_spancy_explore.ipynb` | Colab notebook for SpaNCy-Flow: training, diagnostics, ensemble, kBET |
 
 ## Dataset-Specific Details (PRAD-CyCIF)
 - **obs columns**: `cell_id`, `sample_id`, `scene_id`, `batch_id`, `x`, `y`
@@ -93,8 +96,21 @@ Ensemble outliers: Ki67 (0.13), NOTCH1 (0.24), FOXA1 (0.10) still have residual 
 
 **Pending**: Re-running kBET with per-model correction path fix (each GNN sees its own X_corrected). Results expected to improve further.
 
+## Benchmark Targets (set 2026-04-30)
+Full benchmark run completed in `mxnorm/mxnorm_benchmark.ipynb`. **UniFORM is the best baseline.**
+
+| Method | kBET | Positive pop Δ | Verdict |
+|---|---|---|---|
+| MXnorm | 0.244 | −3.0% | Poor kBET, collapses on g3/g4/g5 |
+| ComBat | 0.286 | −2.5% | Poor kBET, collapses on g3/g4/g5 |
+| Z-Score | 0.293 | **−0.7%** | Best biology preservation, poor kBET |
+| UniFORM | **0.631** | −3.4% (large distortions) | Best kBET but destroys ChromA/CD45/PD1, inflates EPCAM/GZMB/CD56 |
+
+**SpaNCy dual target**: kBET > 0.631 AND positive population |Δ| < 5% per marker. UniFORM achieves kBET by distorting biology — not acceptable. SpaNCy ensemble hybrid at 0.574 (v1) is 0.057 below UniFORM.
+
 ## Known Issues / Next Steps
-- **Ensemble hybrid kBET re-run pending** — per-model correction paths should give stronger GNN deltas. Testing alpha range 0.1–1.0.
+- **Ensemble hybrid kBET v2 re-run pending** — per-model correction paths should give stronger GNN deltas than v1 (0.574). Testing alpha range 0.1–1.0.
+- **Primary target**: beat UniFORM kBET (0.631) while keeping positive population |Δ| < 5% per marker.
 - Ki67, NOTCH1, FOXA1 have residual batch effect even with ensemble — may need more models (5 instead of 3) or more epochs.
 - g5 group sometimes returns NaN in kBET — numerical instability in pegasus, now handled with NaN detection.
 - Training on 1.76M cells takes significant time. Use `--epochs 10` for testing, `--epochs 100` for production.
